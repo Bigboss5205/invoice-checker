@@ -202,9 +202,10 @@ Write-Host "  用法：把「发票查验.exe」拷到放发票的目录，双�
 Write-Host "        没有 config.yaml 也能跑（默认查程序所在目录）。"
 Write-Host ""
 if (-not $NoOcr) {
-    Write-Host "  验证码：自动识别优先，认不出会弹窗让你输入。" -ForegroundColor Cyan
+    Write-Host "  验证码：默认弹窗人工输入（想试自动识别，把 config.yaml 里" -ForegroundColor Cyan
+    Write-Host "          captcha.auto_ocr 改成 true）。位数不固定，输完点提交。" -ForegroundColor Cyan
 } else {
-    Write-Host "  验证码：本次为 -NoOcr 构建，全部需要人工输入。" -ForegroundColor Yellow
+    Write-Host "  验证码：本次为 -NoOcr 构建，只能人工输入。" -ForegroundColor Yellow
 }
 Write-Host "  浏览器：使用系统自带的 Edge，未捆绑 Chromium。" -ForegroundColor Cyan
 Write-Host ""
