@@ -150,10 +150,10 @@ class CaptchaDialog(tk.Toplevel):
         self._render_image(payload.get("png") or b"")
         self.image_label.bind("<Button-1>", lambda _e: self._skip())
 
-        ttk.Label(body, text="请输入图中的 4 位字符（输入满 4 位自动提交）",
+        ttk.Label(body, text="请输入图中的字符（按回车，或点下面的「提交」）",
                   foreground=COLOR_DIM).pack(anchor="w")
 
-        self.entry = ttk.Entry(body, font=("Consolas", 20), width=12,
+        self.entry = ttk.Entry(body, font=("Consolas", 20), width=14,
                                justify="center")
         self.entry.pack(pady=8)
         self.entry.focus_set()
@@ -187,14 +187,19 @@ class CaptchaDialog(tk.Toplevel):
                                        padding=20)
 
     def _on_key(self, event) -> None:
+        """只做「去空格 + 转大写」，**不自动提交**。
+
+        曾经写成「满 4 位就自动提交」，但平台的验证码**不一定是 4 位**：
+        提示是「请输入验证码图片中蓝色文字」，图里字符总数可能多于要填的数量，
+        到底几位取决于其中有几个是蓝色的。长度不能写死，
+        所以提交交给回车或「提交」按钮。
+        """
         if event.keysym in {"Return", "Tab", "Shift_L", "Shift_R"}:
             return
         text = self.entry.get().replace(" ", "").upper()
         if text != self.entry.get():
             self.entry.delete(0, "end")
             self.entry.insert(0, text)
-        if len(text) >= 4:
-            self._submit()
 
     def _submit(self) -> None:
         text = self.entry.get().strip()
