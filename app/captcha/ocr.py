@@ -30,7 +30,13 @@ _lock = threading.Lock()
 _engine: Any = None
 _probed = False
 
-EXPECTED_LENGTH = 4
+# 验证码长度**不固定**，不能写死 4 位。
+#
+# 平台的提示是「请输入验证码图片中蓝色文字」——图里字符总数可能多于要填的数量，
+# 到底几位取决于其中有几个是蓝色的。所以这里只做一个宽松的合理性区间：
+# 太短（1 个字符）基本是没认出来，太长则多半是把干扰线也读进来了。
+MIN_LENGTH = 2
+MAX_LENGTH = 8
 
 _JUNK = set(" \t\n\r=+*_-.,:;'\"`~^<>[]{}()\\/|")
 
@@ -172,8 +178,9 @@ def _recognize(png: bytes) -> str | None:
         return None
 
     text = "".join(ch for ch in str(raw) if ch not in _JUNK).strip()
-    if len(text) != EXPECTED_LENGTH:
-        log.debug("识别结果长度不是 %d，丢弃：%r", EXPECTED_LENGTH, raw)
+    if not (MIN_LENGTH <= len(text) <= MAX_LENGTH):
+        log.debug("识别结果长度 %d 不在 %d-%d 之间，丢弃：%r",
+                  len(text), MIN_LENGTH, MAX_LENGTH, raw)
         return None
     return text
 
