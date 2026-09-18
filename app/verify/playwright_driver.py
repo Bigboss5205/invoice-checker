@@ -68,7 +68,8 @@ class PlaywrightVerifier(BaseVerifier):
     def __init__(self, cfg, prompter=None):
         super().__init__(cfg, prompter)
 
-        self.home_url = str(cfg.get("platform.home_url"))
+        self.mode = cfg.platform_mode          # legacy | spa
+        self.home_url = cfg.start_url
         self.headless = bool(cfg.get("verify.headless", True))
         self.channel = str(cfg.get("verify.browser_channel", "msedge") or "").strip()
         self.nav_timeout = int(cfg.get("verify.nav_timeout_ms", 45000))
@@ -279,7 +280,7 @@ class PlaywrightVerifier(BaseVerifier):
             return VerifyOutcome(status="error",
                                  summary=f"入参不完整，缺少：{', '.join(missing)}")
 
-        log.debug("打开 %s", self.home_url)
+        log.debug("打开 %s（模式 %s）", self.home_url, self.mode)
         page.goto(self.home_url, wait_until="load", timeout=self.nav_timeout)
 
         # 以「发票号码输入框出现」作为表单就绪信号（实测约 1-6 秒）。
@@ -359,7 +360,12 @@ class PlaywrightVerifier(BaseVerifier):
             if auto_left > 0:
                 auto_left -= 1
                 source = "ocr"
-                text = captcha_ocr.solve(png)
+                # 每次现读提示要哪个颜色：平台会在蓝/红之间切换，
+                # 写死一种颜色会把另一类验证码全认错。
+                color = self._read_captcha_color(page)
+                if color:
+                    log.debug("验证码要求填%s色文字", color)
+                text = captcha_ocr.solve(png, color)
                 if not text:
                     log.debug("第 %d 次自动识别失败", attempts)
                     if png_hash == last_hash:
@@ -419,6 +425,10 @@ class PlaywrightVerifier(BaseVerifier):
 
             if status == "captcha_wrong":
                 log.info("第 %d 次验证码被平台拒绝", attempts)
+                # 平台是用一个模态框报错的，不点掉它就一直挡着，下一轮点击白点；
+                # 同时主动刷新验证码——否则截图还是同一张，白费一次尝试。
+                self._dismiss_alert(page)
+                self._refresh_captcha(page)
                 continue
 
             if status == "unknown":
@@ -487,7 +497,12 @@ class PlaywrightVerifier(BaseVerifier):
             log.error("填不进发票号码。页面状态：%s", self._page_state(page))
             return {"ok": False, "reason": "找不到发票号码输入框（选择器可能已失效）"}
 
-        # 等平台根据号码/代码切换第 4 个字段的形态
+        # 挪开焦点：平台是靠 onblur/onchange 来切换第 4 个字段形态的，
+        # 一直停留在号码框里它就不切换，于是取值会按上一个形态取错。
+        try:
+            page.keyboard.press("Tab")
+        except Exception:
+            pass
         page.wait_for_timeout(1500)
 
         value_ok, reason = self._fill_value_field(page, inputs)
@@ -504,41 +519,83 @@ class PlaywrightVerifier(BaseVerifier):
 
         return {"ok": True}
 
+    def _read_value_label(self, page, settle_ms: int = 2000) -> str:
+        """读取第 4 个字段**当前**的标签。
+
+        平台会按发票号码/代码把这个字段在「开具金额(不含税)」「价税合计」
+        「校验码」之间切换，而且**切换是异步的**——填完号码立刻读，
+        很可能还是上一个形态，于是取值就取错了（实测踩过：
+        标签已经是「价税合计」，却按「不含税金额」取了 866.51 而不是 940.00，
+        这种错误提交上去结论必然是错的）。
+
+        所以这里先等一会儿，再连续读到两次一致才认。
+        """
+        page.wait_for_timeout(settle_ms)
+        label = ""
+        for _ in range(6):
+            if self.mode == "legacy":
+                node = self._locator(page, "value_label", wait_ms=800)
+                text = node.inner_text() if node is not None else ""
+            else:
+                node = self._locator(page, "value_item", wait_ms=800)
+                text = node.inner_text() if node is not None else ""
+            text = (text or "").replace(" ", "").replace("\n", "")
+            if text and text == label:
+                return text
+            label = text
+            page.wait_for_timeout(600)
+        return label
+
     def _fill_value_field(self, page, inputs: dict[str, Any]) -> tuple[bool, str]:
-        """第 4 个字段：**先读标签，再决定填什么**。
+        """第 4 个字段：**先读标签，再决定填什么**，填完还要复核一遍。
 
         实测三种形态：
           开具金额(不含税) → 不含税金额
           校验码          → 校验码后 6 位
           价税合计        → 价税合计
+
+        为什么要复核：平台的形态切换是**异步**的。实测第一轮读到的还是
+        「开具金额(不含税)」于是填了不含税金额 866.51，可这张票的价税合计是 940.00——
+        如果第一次验证码就通过，提交上去的就是错值，结论必然是错的。
+        所以填完再读一次标签，变了就按新形态重填。
         """
-        item = self._locator(page, "value_item", wait_ms=4000)
-        if item is None:
+        if self._locator(page, "value_input", wait_ms=4000) is None:
             return False, "找不到「校验码 / 金额」输入项（选择器可能已失效）"
 
-        try:
-            label = item.inner_text().replace(" ", "").replace("\n", "")
-        except Exception:
-            label = ""
+        last_label = ""
+        for attempt in range(3):
+            label = self._read_value_label(page, settle_ms=2000 if attempt == 0 else 1200)
+            value, what = self._pick_value(label, inputs)
+            if value is None:
+                return False, f"表单当前需要「{what}」，但这张票没有识别出该值"
 
-        if "校验码" in label:
-            value = inputs.get("check_code_last6")
-            what = "校验码后6位"
-        elif "价税合计" in label:
-            value = inputs.get("amount_total") or inputs.get("amount_excl_tax")
-            what = "价税合计"
-        else:  # 开具金额(不含税) 或其它含「金额」的形态
-            value = inputs.get("amount_excl_tax") or inputs.get("amount_total")
-            what = "开具金额(不含税)"
+            if not self._fill_field(page, "value_input", str(value)):
+                return False, f"「{what}」输入框填不进去（选择器可能已失效）"
 
-        if not value:
-            return False, f"表单当前需要「{what}」，但这张票没有识别出该值"
+            log.info("第 4 字段标签「%s」→ 填入%s %s", label[:14], what, value)
 
-        if not self._fill_field(page, "value_input", str(value)):
-            return False, f"「{what}」输入框填不进去（选择器可能已失效）"
+            # 复核：形态没变就收工
+            page.wait_for_timeout(700)
+            again = self._read_value_label(page, settle_ms=600)
+            if again == label or not again:
+                return True, ""
+            log.info("第 4 字段标签变成了「%s」，按新形态重填", again[:14])
+            last_label = again
 
-        log.debug("第 4 字段标签含「%s」，填入 %s", label[:12], what)
+        log.warning("第 4 字段形态反复变化，最后一次按「%s」填的，请留意结论", last_label[:14])
         return True, ""
+
+    @staticmethod
+    def _pick_value(label: str, inputs: dict[str, Any]) -> tuple[Any, str]:
+        """按标签决定取哪个值。返回值 (值, 中文名)；值为 None 表示这张票没有该项。"""
+        if "校验码" in label:
+            return inputs.get("check_code_last6"), "校验码后6位"
+        if "价税合计" in label:
+            return (inputs.get("amount_total") or inputs.get("amount_excl_tax"),
+                    "价税合计")
+        # 开具金额(不含税) 或其它含「金额」的形态
+        return (inputs.get("amount_excl_tax") or inputs.get("amount_total"),
+                "开具金额(不含税)")
 
     def _fill_field(self, page, name: str, value: str) -> bool:
         loc = self._locator(page, name, wait_ms=5000)
@@ -581,12 +638,67 @@ class PlaywrightVerifier(BaseVerifier):
         m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", str(iso_date or ""))
         if not m:
             return False
-        year, month, day = m.group(1), str(int(m.group(2))), str(int(m.group(3)))
+        ymd = f"{m.group(1)}{m.group(2)}{m.group(3)}"
 
         loc = self._locator(page, "invoice_date", wait_ms=5000)
         if loc is None:
             return False
 
+        if self.mode == "legacy":
+            return self._set_date_legacy(page, loc, ymd)
+
+        return self._set_date_spa(page, loc, m.group(1), str(int(m.group(2))),
+                                  str(int(m.group(3))))
+
+    def _set_date_legacy(self, page, loc, ymd: str) -> bool:
+        """旧版：这是个带假占位符的普通输入框，但站点 JS 会覆盖键盘输入。
+
+        实测三种写法只有「点一下清掉占位符，再用原生 setter 写值并派发事件」
+        能生效——直接 type/fill 都会被站点自己的处理逻辑抹回 YYYYMMDD。
+        """
+        try:
+            loc.click()          # 点一下，让站点的占位符逻辑先跑
+        except Exception:
+            pass
+        page.wait_for_timeout(300)
+        try:
+            loc.evaluate(
+                """(el, v) => {
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(el, v);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                }""",
+                ymd,
+            )
+        except Exception as exc:
+            log.warning("旧版日期写入失败：%s", exc)
+            return False
+
+        page.wait_for_timeout(600)
+        got = (self._input_value(loc) or "").replace("-", "").replace("/", "")
+        if got != ymd:
+            log.warning("日期回读不一致：期望 %s，实际 %r", ymd, got)
+            return False
+
+        # 关掉日期弹出的日历面板。它会浮在页面上**挡住「查验」按钮**，
+        # 这时点提交其实点在日历上，请求根本发不出去——实测踩过这个坑。
+        self._dismiss_popups(page)
+        return True
+
+    @staticmethod
+    def _dismiss_popups(page) -> None:
+        """按 Esc 关掉可能挡住按钮的浮层（日期面板、下拉等）。"""
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+    def _set_date_spa(self, page, loc, year: str, month: str, day: str) -> bool:
+        """新版：readonly 的 TDesign 日历，只能点选年 → 月 → 日。"""
         try:
             loc.click()
         except Exception as exc:
@@ -664,12 +776,33 @@ class PlaywrightVerifier(BaseVerifier):
     #  提交与结果
     # ==================================================================
     def _click_submit(self, page) -> bool:
-        """点「查验」。按钮在必填项齐了之后才会从 disabled 变可点。"""
+        """点「查验」。
+
+        旧版有两个「查 验」按钮（#checkfp / #uncheckfp），由站点 JS 切换显示，
+        所以要按顺序找到真正可见且可点的那一个；
+        新版只有一个，且在必填项齐了之前是 disabled，需要等它变可点。
+        """
+        if self.mode == "legacy":
+            # 提交前再关一次浮层：万一还有面板挡着，点击就白点了
+            self._dismiss_popups(page)
+            for sel in self._candidates("submit"):
+                try:
+                    loc = page.locator(sel).first
+                    if loc.count() == 0 or not loc.is_visible() or not loc.is_enabled():
+                        continue
+                    loc.click(timeout=8000)
+                    page.wait_for_timeout(300)
+                    log.debug("已点击查验按钮 %s", sel)
+                    return True
+                except Exception as exc:
+                    log.debug("点击 %s 失败：%s", sel, exc)
+                    continue
+            return False
+
         loc = self._locator(page, "submit", wait_ms=4000)
         if loc is None:
             return False
-        # 等它变成可点（最多 8 秒）
-        for _ in range(16):
+        for _ in range(16):          # 等它从 disabled 变可点（最多 8 秒）
             try:
                 if loc.is_enabled():
                     break
@@ -703,6 +836,14 @@ class PlaywrightVerifier(BaseVerifier):
         body = ""
 
         while time.monotonic() < deadline:
+            # 0) 平台自绘的提示框——旧版把「验证码错误!」这类结论都放这里，
+            #    优先读它：比扫整页文本准，也不会被帮助文字干扰
+            alert = self._read_alert_message(page)
+            if alert:
+                status = classify(alert, self.cfg, "")
+                if status != "unknown":
+                    return status, alert, self._body_text(page)
+
             # 2) 兜底：万一 expect_response 没接住，再看看监听器有没有存下响应
             if api is None:
                 payload = self._take_query_payload()
@@ -742,7 +883,8 @@ class PlaywrightVerifier(BaseVerifier):
     #  选择器 / 元素操作
     # ==================================================================
     def _candidates(self, name: str) -> list[str]:
-        raw = self.cfg.get(f"platform.selectors.{name}", []) or []
+        """取候选选择器。两套页面结构不同，由 config 按 mode 给出对应的那一套。"""
+        raw = self.cfg.selectors().get(name) or []
         if isinstance(raw, str):
             return [raw]
         return [str(s) for s in raw if s]
@@ -768,6 +910,69 @@ class PlaywrightVerifier(BaseVerifier):
             if wait_ms <= 0 or time.monotonic() >= deadline:
                 return None
             page.wait_for_timeout(300)
+
+    def _read_alert_message(self, page) -> str:
+        """读平台自绘提示框里的文字。
+
+        旧版把「验证码错误!」「查无此票」这类结论都放在
+        ``<div id="popup_message">`` 里。直接读它比扫描整页文本准得多——
+        整页文本里混着帮助说明，还容易把提交前就存在的文字误判成结论。
+        """
+        for sel in self._candidates("alert_message"):
+            try:
+                loc = page.locator(sel).first
+                if loc.count() == 0 or not loc.is_visible():
+                    continue
+                return (loc.inner_text() or "").strip()
+            except Exception:
+                continue
+        return ""
+
+    def _dismiss_alert(self, page) -> bool:
+        """关掉平台弹出的「提示」模态框。
+
+        旧版用 alert 风格的模态框报告「验证码错误!」，不点确定它就一直挡着，
+        后续的点击全都落在它身上——实测踩过这个坑（点了提交却没有任何请求发出）。
+        """
+        for sel in self._candidates("alert_ok"):
+            try:
+                loc = page.locator(sel).first
+                if loc.count() == 0 or not loc.is_visible():
+                    continue
+                loc.click(timeout=3000)
+                page.wait_for_timeout(500)
+                log.debug("已关闭提示框（%s）", sel)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _read_captcha_color(self, page) -> str | None:
+        """从页面提示里读出「这次的验证码要填哪个颜色」。
+
+        平台提示形如「请输入验证码图片中蓝色文字」/「…红色文字」，
+        **颜色是会变的**（实测蓝、红都出现过），所以每次都要现读。
+        写死一种颜色会把另一类验证码全部认错，还不如不做分离。
+        """
+        # 先看提示元素
+        for name in ("captcha_hint", "captcha_input"):
+            loc = self._locator(page, name, wait_ms=400)
+            if loc is None:
+                continue
+            try:
+                text = loc.inner_text() or ""
+            except Exception:
+                continue
+            color = captcha_ocr.parse_color_hint(text)
+            if color:
+                return color
+
+        # 兜底：整页文本里找一次
+        body = self._body_text(page)
+        index = body.find("验证码图片中")
+        if index >= 0:
+            return captcha_ocr.parse_color_hint(body[index:index + 20])
+        return None
 
     def _refresh_captcha(self, page) -> bool:
         for name in ("captcha_refresh", "captcha_image"):

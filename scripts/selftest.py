@@ -939,9 +939,9 @@ def check_captcha_ocr() -> bool:
     ok = True
 
     def blue_separation():
-        """颜色分离：平台要求只填「图片中蓝色文字」。
+        """颜色分离：平台会指定「只填图片中蓝/红色文字」。
 
-        造一张左蓝右白的图，分离后应只剩蓝色那部分（且转成黑字白底）。
+        造一张左蓝右红的图，分离后应只剩指定的那部分（且转成黑字白底）。
         """
         import io as _io
 
@@ -950,29 +950,40 @@ def check_captcha_ocr() -> bool:
         img = Image.new("RGB", (40, 20), (255, 255, 255))
         for x in range(2, 12):
             for y in range(2, 12):
-                img.putpixel((x, y), (0, 0, 255))      # 蓝块（应保留）
+                img.putpixel((x, y), (0, 0, 255))      # 蓝块
         for x in range(20, 30):
             for y in range(2, 12):
-                img.putpixel((x, y), (255, 0, 0))      # 红块（应丢弃）
+                img.putpixel((x, y), (255, 0, 0))      # 红块
         buf = _io.BytesIO()
         img.save(buf, format="PNG")
+        png = buf.getvalue()
 
-        out = ocr.blue_filter(buf.getvalue())
-        assert out, "应该能从图里分离出蓝色像素"
-        result = Image.open(_io.BytesIO(out)).convert("RGB")
-        colors = set(result.getdata())
+        blue = ocr.color_filter(png, "blue")
+        assert blue, "应该能从图里分离出蓝色像素"
+        colors = set(Image.open(_io.BytesIO(blue)).convert("RGB").getdata())
         assert (0, 0, 0) in colors, "蓝色像素应被转成黑色（便于 OCR）"
         assert (255, 0, 0) not in colors, "红色像素不该被保留"
 
-        # 全灰的图不该被判成「蓝色文字验证码」
+        red = ocr.color_filter(png, "red")
+        assert red, "应该能从图里分离出红色像素"
+        colors_r = set(Image.open(_io.BytesIO(red)).convert("RGB").getdata())
+        assert (0, 0, 0) in colors_r and (0, 0, 255) not in colors_r, \
+            "按红色分离时应保留红块、丢弃蓝块"
+
+        # 全灰的图不该被判成任一颜色
         grey = Image.new("RGB", (40, 20), (128, 128, 128))
         gbuf = _io.BytesIO()
         grey.save(gbuf, format="PNG")
-        assert ocr.blue_filter(gbuf.getvalue()) is None, \
+        assert ocr.color_filter(gbuf.getvalue(), "blue") is None, \
             "没有蓝色像素时应返回 None，而不是给出一张空图"
-        return "蓝块保留转黑、红块丢弃、无蓝色时返回 None"
 
-    ok &= check("颜色分离（只取蓝色文字）", blue_separation)
+        # 提示文字 → 颜色
+        assert ocr.parse_color_hint("请输入验证码图片中蓝色文字") == "blue"
+        assert ocr.parse_color_hint("请输入验证码图片中红色文字") == "red"
+        assert ocr.parse_color_hint("请输入验证码") is None
+        return "蓝/红分离各自正确，无该颜色时返回 None，提示文字解析正确"
+
+    ok &= check("颜色分离（按提示取色）", blue_separation)
 
     if not ocr.available():
         record("SKIP", "ddddocr 初始化",
@@ -1091,6 +1102,221 @@ _LEGACY_INPUTS = {
 }
 
 
+def mock_legacy_page() -> str:
+    """按**实测的旧版页面结构**搭的模拟页（id 与真实站点完全一致）。
+
+    把这次实测踩到的四个坑都复现出来，作为回归用例：
+      1) 第 4 字段形态**异步切换**（号码失焦后才变成「价税合计」）
+      2) 开票日期是带假占位符的输入框，键盘输入会被站点 JS 抹掉
+      3) 结论放在自绘弹窗 #popup_message 里，不在整页文本里
+      4) 「确定」是 input[type=button] 而不是 <button>，不关掉会挡住后续点击
+    """
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (120, 50), (245, 245, 245)).save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    return """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>模拟旧版查验页</title></head>
+<body>
+<table>
+  <tr><td>发票代码：</td><td><input type="text" id="fpdm"></td></tr>
+  <tr><td>*发票号码：</td><td><input type="text" id="fphm" maxlength="20"></td></tr>
+  <tr><td>*开票日期：</td><td><input type="text" id="kprq" maxlength="8"
+        value="YYYYMMDD" style="color:#999999"></td></tr>
+  <tr><td><span id="context">开具金额(不含税)：</span></td>
+      <td><input type="text" id="kjje"></td></tr>
+  <tr><td>*验证码：</td><td><input type="text" id="yzm">
+      <img id="yzm_img" width="120" height="50"
+           src="data:image/png;base64,""" + b64 + """" />
+      <span>点击图片刷新</span><span>请输入验证码图片中蓝色文字</span></td></tr>
+</table>
+<input type="button" value="扫描" id="smcy">
+<button id="checkfp">查 验</button>
+<div id="popup_overlay" style="display:none"></div>
+<div id="popup_container" style="display:none">
+  <h1 id="popup_title">提示</h1>
+  <div id="popup_message"></div>
+  <input type="button" value=" 确定 " id="popup_ok">
+</div>
+<script>
+  // 坑1：号码失焦后才切换第 4 字段形态（异步）
+  document.getElementById('fphm').addEventListener('blur', function () {
+    document.getElementById('context').textContent = '价税合计：';
+  });
+  // 坑2：站点 JS 会「抹掉不合法的输入」——逐字符敲的时候，每个中间状态
+  //      都不合法，所以键盘输入永远填不进去；一次性写入合法值才留得住。
+  var kprq = document.getElementById('kprq');
+  kprq.addEventListener('input', function () {
+    if (!/^\\d{8}$/.test(kprq.value)) { kprq.value = 'YYYYMMDD'; }
+  });
+  // 坑3：结论放在自绘弹窗里
+  document.getElementById('checkfp').addEventListener('click', function () {
+    var y = document.getElementById('yzm').value.trim();
+    document.getElementById('popup_message').textContent =
+      (y === 'AB12') ? '查验成功，发票信息一致' : '验证码错误!';
+    document.getElementById('popup_container').style.display = '';
+    document.getElementById('popup_overlay').style.display = '';
+  });
+  document.getElementById('popup_ok').addEventListener('click', function () {
+    document.getElementById('popup_container').style.display = 'none';
+    document.getElementById('popup_overlay').style.display = 'none';
+  });
+</script>
+</body></html>"""
+
+
+def check_legacy_mode() -> bool:
+    section("旧版页面流程（模拟页）")
+
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+    except ImportError:
+        record("SKIP", "旧版流程", "未安装 playwright")
+        return True
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        record("SKIP", "旧版流程", "未安装 Pillow")
+        return True
+
+    from app.config import load_config
+    from app.verify.playwright_driver import PlaywrightVerifier
+
+    import tempfile
+    from pathlib import Path
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="legacypage-"))
+    target = tmpdir / "legacy.html"
+    target.write_text(mock_legacy_page(), encoding="utf-8")
+
+    cfg = load_config()
+    cfg.data["verify"]["browser_channel"] = "msedge"
+    cfg.data["platform"]["mode"] = "legacy"
+    cfg.data["platform"]["home_url"] = target.as_uri()
+    cfg.data["captcha"]["auto_ocr"] = False
+    cfg.data["captcha"]["max_auto_attempts"] = 0
+    cfg.data["captcha"]["manual_max_rounds"] = 1
+
+    class Stub:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, task_id, png, *, filename="", hint="", timeout=180.0):
+            self.calls += 1
+            return "ZZZZ"        # 故意错：验证「弹窗报错 → 关闭 → 重试」
+
+    stub = Stub()
+    verifier = PlaywrightVerifier(cfg, stub)
+    state: dict = {}
+    ok = True
+
+    def start():
+        verifier.start()
+        state["page"] = verifier._ensure_page()
+        return f"浏览器已启动（{verifier._channel_used}），模式 {verifier.mode}"
+
+    if not check("启动浏览器（legacy）", start):
+        try:
+            verifier.close()
+        except Exception:
+            pass
+        return False
+
+    page = state["page"]
+
+    def load_mock():
+        page.goto(cfg.start_url, wait_until="load", timeout=30000)
+        page.wait_for_timeout(500)
+        return f"已加载模拟旧版页面（{cfg.start_url}）"
+
+    ok &= check("加载模拟旧版页面", load_mock)
+
+    def locate():
+        # alert_ok 不参与：它只在弹窗弹出时才可见
+        for name in ("invoice_code", "invoice_number", "invoice_date",
+                     "value_label", "value_input", "captcha_input",
+                     "captcha_image", "submit"):
+            assert verifier._locator(page, name, wait_ms=2000) is not None, \
+                f"按旧版选择器定位不到 {name}"
+        return "八个元素全部按旧版 id 选择器定位成功"
+
+    ok &= check("旧版元素定位", locate)
+
+    def date_js_setter():
+        """坑2：键盘输入会被站点 JS 抹掉，必须用原生 setter 写值。"""
+        assert verifier._set_date(page, "2024-03-15"), "日期设置失败"
+        got = page.locator("#kprq").input_value()
+        assert got == "20240315", f"日期回读不对：{got!r}"
+        return f"日期写入成功且没被站点 JS 抹掉：{got}"
+
+    ok &= check("旧版日期填充（原生 setter）", date_js_setter)
+
+    def label_switch():
+        """坑1：形态异步切换，必须等切换完再取值。"""
+        page.locator("#fphm").fill("26447000001819068870")
+        page.keyboard.press("Tab")          # 失焦才触发站点切换
+        page.wait_for_timeout(800)
+        label = verifier._read_value_label(page, settle_ms=800)
+        assert "价税合计" in label, f"标签应切换为价税合计，实际 {label!r}"
+
+        value, what = verifier._pick_value(label, _LEGACY_INPUTS)
+        assert what == "价税合计", f"应取价税合计，实际 {what}"
+        assert value == "1130.00", f"价税合计应取 amount_total，实际 {value!r}"
+
+        value2, what2 = verifier._pick_value("开具金额(不含税)：", _LEGACY_INPUTS)
+        assert what2 == "开具金额(不含税)" and value2 == "1000.00", \
+            f"不含税形态取值不对：{what2}/{value2}"
+        return f"价税合计→{value}，不含税→{value2}，按标签分流正确"
+
+    ok &= check("旧版第 4 字段按标签取值", label_switch)
+
+    def popup_flow():
+        """坑3+4：结论在自绘弹窗里，且「确定」是 input[type=button]。"""
+        assert verifier._fill_field(page, "captcha_input", "ZZZZ")
+        assert verifier._click_submit(page), "查验按钮点不动"
+        status, summary, _body = verifier._wait_result(page, "")
+        assert status == "captcha_wrong", \
+            f"应从 #popup_message 读到「验证码错误」，实际 {status}：{summary}"
+        assert verifier._dismiss_alert(page), "弹窗没关掉（会挡住后续点击）"
+        assert verifier._read_alert_message(page) == "", "关闭后弹窗文字应该读不到了"
+        return f"读到弹窗结论「{summary}」并能正确关闭"
+
+    ok &= check("旧版弹窗结论文案", popup_flow)
+
+    def full_legacy_flow():
+        """旧版完整走一遍：填表 → 取码 → 提交 → 读弹窗结论。"""
+        flow = PlaywrightVerifier(cfg, Stub())
+        flow.start()
+        try:
+            outcome = flow.verify("legacy-full", dict(_LEGACY_INPUTS),
+                                  filename="旧版票.pdf", want_pdf=False)
+        finally:
+            flow.close()
+        assert outcome.status == "captcha_wrong", \
+            f"完整流程应判 captcha_wrong，实际 {outcome.status}：{outcome.summary}"
+        return f"端到端跑通：{outcome.status} / {outcome.summary}"
+
+    # 先关掉上一个驱动：Playwright 同步 API 同线程不能有两个实例
+    try:
+        verifier.close()
+    except Exception as exc:
+        record("FAIL", "关闭驱动（legacy）", str(exc))
+        ok = False
+
+    ok &= check("旧版完整流程（端到端）", full_legacy_flow)
+
+    try:
+        target.unlink()
+        tmpdir.rmdir()
+    except OSError:
+        pass
+    return ok
+
+
 def check_driver() -> bool:
     section("查验驱动（对着模拟页面演练）")
 
@@ -1112,6 +1338,9 @@ def check_driver() -> bool:
 
     cfg = load_config()
     cfg.data["verify"]["browser_channel"] = "msedge"
+    # 这套测试用的是**新版（SPA）结构**的模拟页，所以显式指定 spa 模式，
+    # 否则会拿旧版选择器去匹配 SPA 的类名，必然定位失败。
+    cfg.data["platform"]["mode"] = "spa"
 
     verifier = PlaywrightVerifier(cfg)
     state: dict = {}
@@ -1296,7 +1525,11 @@ def check_driver() -> bool:
 
         flow_cfg = load_config()
         flow_cfg.data["verify"]["browser_channel"] = "msedge"
+        flow_cfg.data["platform"]["mode"] = "spa"
+        # 两个都要改：spa 模式下 start_url 取的是 spa_url，
+        # 只改 home_url 会打到真实站点上去。
         flow_cfg.data["platform"]["home_url"] = target.as_uri()
+        flow_cfg.data["platform"]["spa_url"] = target.as_uri()
         # 让 available() 真的被调用（这是出过问题的那一行），
         # 但把自动次数设成 0，直接走人工分支，测试才稳定快速。
         flow_cfg.data["captcha"]["auto_ocr"] = True
@@ -1374,8 +1607,11 @@ def main() -> int:
     check_gui()
     check_captcha_ocr()
     if args.browser:
+        check_legacy_mode()
         check_driver()
     else:
+        section("旧版页面流程（模拟页）")
+        record("SKIP", "旧版流程", "未指定 --browser，跳过")
         section("查验驱动（对着模拟页面演练）")
         record("SKIP", "驱动演练", "未指定 --browser，跳过（加上它可完整验证驱动机制）")
 

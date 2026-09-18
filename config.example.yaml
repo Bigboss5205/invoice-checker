@@ -57,30 +57,58 @@ ui:
   log_lines: 400
 
 platform:
-  # 入口必须用这个**根地址**。
-  # 实测：直接访问 /national-invoice-check 路由会让懒加载的 chunk 取回 index.html
-  # （服务器对不存在的资源返回 200 + HTML），浏览器当 JS 解析就报错、整页白屏。
-  # 从根地址进入，SPA 自己会路由到查验页。
-  home_url: "https://inv-veri.chinatax.gov.cn/fpcygzfw/"
+  # legacy = 旧版普通 HTML 页面（默认，稳定）；spa = 新版 Vue 单页应用
+  #
+  # 为什么默认用旧版：新版是 Vue SPA，实测它依赖的
+  # assets_res/js/chunk-vendors.ccf6a1dc.js 在服务器上**并不存在**
+  # （请求它返回 index.html，HTTP 状态还是 200）。浏览器把 HTML 当 JS 解析，
+  # 报 "Unexpected token '<'"，Vue 从未挂载、整页空白——而且是间歇性的。
+  # 这是平台自身的部署缺陷；旧版是普通表单，没有这个问题。
+  mode: legacy
+  home_url: "https://inv-veri.chinatax.gov.cn/index.html"
+  spa_url: "https://inv-veri.chinatax.gov.cn/fpcygzfw/"
 
-  # ---------------------------------------------------------------------------
-  #  元素定位：每个字段给一组候选，按顺序找第一个可见的。
-  #  下面是 2026-09 **对着真实站点实测**出来的结构（TDesign 组件库，
-  #  类名带语义、比较稳定）。平台改版后跑 scripts/discover.py 重新抓一份。
-  # ---------------------------------------------------------------------------
+  # 旧版：元素都是页面上的原始 id
+  #   注意「确定」是 input[type=button] 而不是 <button>，
+  #   用 button:has-text('确定') 是选不中的。
+  legacy_selectors:
+    invoice_code:
+      - "#fpdm"
+    invoice_number:
+      - "#fphm"
+    invoice_date:
+      - "#kprq"
+    value_label:
+      - "#context"          # 动态标签：开具金额(不含税) / 价税合计 / 校验码
+    value_input:
+      - "#kjje"
+    captcha_input:
+      - "#yzm"
+    captcha_image:
+      - "#yzm_img"
+    captcha_refresh:
+      - "text=点击图片刷新"
+      - "#yzm_img"
+    captcha_hint:
+      - "#yzminfo"
+      - "#yzm"
+    submit:
+      - "#checkfp"
+      - "#uncheckfp"
+    alert_message:
+      - "#popup_message"
+    alert_ok:
+      - "#popup_ok"
+      - "input[value*='确定']"
+
+  # 新版 SPA 的选择器（只有 mode: spa 时用；平台改版后跑 scripts/discover.py 重抓）
   selectors:
     invoice_number:
       - ".t-form-item__fphm input"
-      - "input[placeholder*='发票号码']"
     invoice_code:
       - ".t-form-item__fpdm input"
-      - "input[placeholder*='发票代码']"
     invoice_date:
       - ".t-form-item__kprq input"
-      - "input[placeholder='YYYYMMDD']"
-    # 第 4 个字段的**标签是动态的**：
-    #   开具金额(不含税) / 校验码 / 价税合计
-    # 所以先定位「表单项」读标签，再决定填什么值。
     value_item:
       - ".t-form-item__kpje"
       - ".t-form-item__kjh"
@@ -91,19 +119,21 @@ platform:
       - ".t-form__label"
     captcha_input:
       - ".t-form-item__yzm input"
-      - "input[placeholder*='验证码']"
     captcha_image:
       - "form.t-form img"
-      - "img[src*='captcha']"
     captcha_refresh:
       - ".form-box-tip__yzm"
-      - "text=点击图片刷新"
-    # 查验按钮：class 含 t-button 且 type=submit 的只有它
-    # （扫描/导入的类名是 button-span，重置是 type=reset）
+    captcha_hint:
+      - ".yzm-tips"
+      - ".form-box-tip"
     submit:
       - "button.t-button[type='submit']"
-      - "button:has-text('查 验')"
-    # 日期面板（开票日期是只读的日历选择器，只能点选）
+    alert_ok:
+      - "#popup_ok"
+      - ".t-dialog button"
+    alert_message:
+      - "#popup_message"
+      - ".t-dialog__body"
     date_year_select:
       - ".t-date-picker__header-controller-year input"
     date_month_select:
@@ -112,10 +142,6 @@ platform:
       - ".t-select-option"
     date_cell:
       - ".t-date-picker__cell"
-    result_area:
-      - "form.t-form"
-      - "body"
-
   # 平台返回文案 → 结论。匹配是「包含」关系，从上往下第一个命中生效。
   # 结论优先取自 queryFpcyxx 接口返回的 CyjgMsg（更早更准），页面文本兜底。
   result_keywords:

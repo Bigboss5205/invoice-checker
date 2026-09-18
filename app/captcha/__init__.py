@@ -11,6 +11,20 @@
  没有跑完整流程，所以没暴露。）
 """
 
-from .ocr import available, blue_filter, engine_name, solve  # noqa: F401
+from .ocr import (  # noqa: F401
+    available,
+    blue_filter,
+    color_filter,
+    engine_name,
+    parse_color_hint,
+    solve,
+)
 
-__all__ = ["available", "blue_filter", "engine_name", "solve"]
+__all__ = [
+    "available",
+    "blue_filter",
+    "color_filter",
+    "engine_name",
+    "parse_color_hint",
+    "solve",
+]

@@ -1,20 +1,20 @@
-"""验证码自动识别（ddddocr + 颜色分离）。
+"""验证码自动识别（ddddocr + 按提示做颜色分离）。
 
 这个平台的验证码有个特点（2026-09 实测）
 ----------------------------------------
-图片提示是「请输入验证码图片中**蓝色文字**」——一张图里混着几种颜色的字符，
-只需要填写**蓝色**的那些。而且字符是**中文与字母混排**的。
+图片旁边会写一句提示，形如：
+
+    请输入验证码图片中**蓝色**文字
+    请输入验证码图片中**红色**文字      ← 实测颜色会在蓝/红之间切换
+
+也就是说一张图里混着几种颜色的字符，**只填指定颜色的那些**。
+而且字符是**中文与字母混排**的（实测见过「村朋FQ」）。
 
 这对自动识别意味着两件事：
 
-1. **必须做颜色分离**。ddddocr 只看形状不看颜色，直接喂原图它会把所有颜色的
-   字符都读出来，结果基本必错。所以先按颜色把蓝色像素挑出来、转成黑字白底，
-   再交给 ddddocr。
+1. **必须先读提示、再按颜色分离**。写死一种颜色，另一类验证码就会全认错。
 2. **成功率有限**。中文+字母混排本来就比纯字母数字难认。所以本模块只当
-   「加速路径」，真正保证流程跑完的是「识别失败 → 刷新重试 → 弹窗人工输入」。
-
-单次成功率可能只有两三成，但重试 N 次的整体成功率是 1-(1-p)^N，
-配合人工兜底，实际体验是「大多数不用你动手，个别的弹窗输一下」。
+   「加速路径」——真正保证流程跑完的是「识别失败 → 刷新重试 → 弹窗人工输入」。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from __future__ import annotations
 import io
 import logging
 import threading
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
@@ -34,11 +34,54 @@ EXPECTED_LENGTH = 4
 
 _JUNK = set(" \t\n\r=+*_-.,:;'\"`~^<>[]{}()\\/|")
 
-# 颜色分离的判定阈值：蓝通道要比红绿都高出这么多，才算「蓝色文字」
-_BLUE_MARGIN = 25
-_BLUE_MIN = 90
-# 分离后至少要有这么多像素才认为这张图确实是蓝色文字验证码
-_MIN_BLUE_PIXELS = 20
+# 分离后至少要留下这么多像素，才认为「这张图确实是该颜色文字」
+_MIN_PIXELS = 20
+
+# 颜色判定：目标通道要比其他通道明显高
+_MARGIN = 25
+_MIN_LEVEL = 90
+
+
+def _is_blue(r: int, g: int, b: int) -> bool:
+    return b - max(r, g) >= _MARGIN and b >= _MIN_LEVEL
+
+
+def _is_red(r: int, g: int, b: int) -> bool:
+    return r - max(g, b) >= _MARGIN and r >= _MIN_LEVEL
+
+
+def _is_green(r: int, g: int, b: int) -> bool:
+    return g - max(r, b) >= 20 and g >= 80
+
+
+def _is_black(r: int, g: int, b: int) -> bool:
+    return max(r, g, b) < 100
+
+
+_RULES: dict[str, Callable[[int, int, int], bool]] = {
+    "blue": _is_blue,
+    "red": _is_red,
+    "green": _is_green,
+    "black": _is_black,
+}
+
+# 提示里的中文颜色词 → 内部名字
+_COLOR_ALIASES: tuple[tuple[str, str], ...] = (
+    ("蓝色", "blue"), ("蓝", "blue"),
+    ("红色", "red"), ("红", "red"),
+    ("绿色", "green"), ("绿", "green"),
+    ("黑色", "black"), ("黑", "black"),
+)
+
+
+def parse_color_hint(text: str) -> str | None:
+    """从提示文字里解析出要填哪种颜色。认不出返回 None。"""
+    if not text:
+        return None
+    for zh, name in _COLOR_ALIASES:
+        if zh in text:
+            return name
+    return None
 
 
 def _build() -> Any:
@@ -67,12 +110,16 @@ def available() -> bool:
         return _engine is not None
 
 
-def blue_filter(png: bytes) -> bytes | None:
-    """只保留偏蓝的像素，转成黑字白底。
+def color_filter(png: bytes, color: str) -> bytes | None:
+    """只保留指定颜色的像素，转成黑字白底，便于 OCR。
 
-    返回 None 表示「这张图不是蓝色文字形态」或缺少 Pillow——
-    调用方据此决定要不要退回到原图识别。
+    返回 None 表示「这张图里几乎没有该颜色的像素」或缺少 Pillow——
+    调用方据此决定要不要退回原图。
     """
+    rule = _RULES.get(color)
+    if rule is None:
+        return None
+
     try:
         from PIL import Image
     except ImportError:
@@ -93,18 +140,23 @@ def blue_filter(png: bytes) -> bytes | None:
     for y in range(height):
         for x in range(width):
             r, g, b = source[x, y]
-            if b - max(r, g) >= _BLUE_MARGIN and b >= _BLUE_MIN:
+            if rule(r, g, b):
                 target[x, y] = (0, 0, 0)
                 kept += 1
 
-    if kept < _MIN_BLUE_PIXELS:
-        log.debug("蓝色像素只有 %d 个，判定不是蓝色文字验证码", kept)
+    if kept < _MIN_PIXELS:
+        log.debug("%s 色像素只有 %d 个，判定这张图不是该颜色验证码", color, kept)
         return None
 
     buf = io.BytesIO()
     out.save(buf, format="PNG")
-    log.debug("颜色分离：保留 %d 个蓝色像素", kept)
+    log.debug("颜色分离（%s）：留下 %d 个像素", color, kept)
     return buf.getvalue()
+
+
+def blue_filter(png: bytes) -> bytes | None:
+    """保留向后兼容：等价于按蓝色分离。"""
+    return color_filter(png, "blue")
 
 
 def _recognize(png: bytes) -> str | None:
@@ -126,16 +178,25 @@ def _recognize(png: bytes) -> str | None:
     return text
 
 
-def solve(png: bytes) -> str | None:
+def solve(png: bytes, color: str | None = None) -> str | None:
     """识别一张验证码。认不出或结果不可信时返回 None。
 
-    依次尝试：颜色分离后的图 → 原图。
-    先试分离版是因为原图混着多种颜色，直接识别基本必错。
+    `color` 是页面提示里要求的颜色（blue/red/green/black）。
+    先试按该颜色分离后的图，再退回原图——
+    原图混着几种颜色，直接识别基本必错，所以分离版优先。
+
+    没给颜色时，把常见颜色都试一遍。
     """
     if not png or not available():
         return None
 
-    attempts = (("颜色分离", blue_filter(png)), ("原图", png))
+    colors = [color] if color else ["blue", "red", "green"]
+    attempts: list[tuple[str, bytes | None]] = []
+    for name in colors:
+        if name:
+            attempts.append((f"{name}色分离", color_filter(png, name)))
+    attempts.append(("原图", png))
+
     for tag, image in attempts:
         if not image:
             continue

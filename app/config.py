@@ -96,38 +96,59 @@ DEFAULTS: dict[str, Any] = {
         "stop_on_consecutive_failures": 0,  # >0 时连续失败这么多次就停下
     },
     "platform": {
-        # 入口必须用这个**根地址**。实测：直接访问 /national-invoice-check 路由
-        # 会让懒加载 chunk 加载失败（服务器对不存在的资源返回 index.html，
-        # 浏览器当 JS 解析就报 "Unexpected token '<'"），整页白屏。
-        # 从根地址进入，SPA 自己会路由到查验页，这是唯一可靠的入口。
-        "home_url": "https://inv-veri.chinatax.gov.cn/fpcygzfw/",
-        # 以下是 2026-09 实测的真实结构（TDesign 组件库，类名语义化且稳定）。
-        # 平台改版后跑 scripts/discover.py 重新抓一份。
+        # 默认用**旧版**页面：它是普通 HTML 表单，元素是最简单的 id（#fpdm/#fphm/…），
+        # 加载过程没有任何懒加载 chunk，稳定得多。
+        #
+        # 为什么不用新版 /fpcygzfw/：新版是 Vue SPA，实测它依赖的
+        # assets_res/js/chunk-vendors.ccf6a1dc.js 在服务器上**并不存在**
+        # （请求它返回的是 index.html，HTTP 还是 200）。浏览器把它当 JS 解析就报
+        # "Unexpected token '<'"，Vue 从未挂载、整页空白——而且是间歇性的。
+        # 这是平台自身的部署缺陷，我们绕开它。
+        "mode": "legacy",          # legacy = 旧版普通页面；spa = 新版 SPA
+        "home_url": "https://inv-veri.chinatax.gov.cn/index.html",
+        "spa_url": "https://inv-veri.chinatax.gov.cn/fpcygzfw/",
+
+        # 旧版（legacy）的选择器——都是页面上的原始 id
+        "legacy_selectors": {
+            "invoice_code": ["#fpdm"],
+            "invoice_number": ["#fphm"],
+            "invoice_date": ["#kprq"],
+            # 第 4 个字段的**标签是动态的**（开具金额(不含税)/价税合计/校验码），
+            # 标签文字就在 #context 里，值填在 #kjje
+            "value_label": ["#context"],
+            "value_input": ["#kjje"],
+            "captcha_input": ["#yzm"],
+            "captcha_image": ["#yzm_img"],
+            "captcha_refresh": ["text=点击图片刷新", "#yzm_img"],
+            "captcha_hint": ["#yzminfo", "#yzm"],
+            "submit": ["#checkfp", "#uncheckfp"],
+            # 旧版把提示/错误都塞进这个自绘弹窗里：
+            #   <div id="popup_message">验证码错误!</div>
+            #   <input type="button" value="&nbsp;确定&nbsp;" id="popup_ok">
+            # 注意「确定」是 input[type=button] 不是 <button>，用 button:has-text 选不中。
+            "alert_message": ["#popup_message"],
+            "alert_ok": ["#popup_ok", "input[value*='确定']", "button:has-text('确定')"],
+        },
+
+        # 新版（spa）的选择器。平台改版后跑 scripts/discover.py 重新抓。
         "selectors": {
-            # 表单就绪的信号：发票号码输入框出现
             "invoice_number": [".t-form-item__fphm input", "input[placeholder*='发票号码']"],
-            # 发票代码（数电票没有这一项，找不到就跳过）
             "invoice_code": [".t-form-item__fpdm input", "input[placeholder*='发票代码']"],
-            # 开票日期：readonly 的日期选择器，必须走日历面板
             "invoice_date": [".t-form-item__kprq input", "input[placeholder='YYYYMMDD']"],
-            # 第 4 个字段的**标签是动态的**（开具金额(不含税) / 校验码 / 价税合计），
-            # 所以先定位「表单项」读标签，再决定填什么值。
-            "value_item": [".t-form-item__kpje", ".t-form-item__kjh", ".t-form-item__kpje"],
+            "value_item": [".t-form-item__kpje", ".t-form-item__kjh"],
             "value_input": [".t-form-item__kpje input", ".t-form-item__kjh input"],
             "value_label": [".t-form__label"],
-            # 验证码
             "captcha_input": [".t-form-item__yzm input", "input[placeholder*='验证码']"],
             "captcha_image": ["form.t-form img", "img[src*='captcha']"],
             "captcha_refresh": [".form-box-tip__yzm", "text=点击图片刷新"],
-            # 查验按钮：class 含 t-button 且 type=submit 的只有它
-            # （扫描/导入的类名是 button-span，重置是 type=reset）
+            "captcha_hint": [".yzm-tips", ".form-box-tip"],
             "submit": ["button.t-button[type='submit']", "button:has-text('查 验')"],
-            # 日期面板
             "date_year_select": [".t-date-picker__header-controller-year input"],
             "date_month_select": [".t-date-picker__header-controller-month input"],
             "date_option": [".t-select-option"],
             "date_cell": [".t-date-picker__cell"],
-            # 结果区（结论主要靠页面文本 + queryFpcyxx 接口返回判定）
+            "alert_ok": ["#popup_ok", "button:has-text('确定')", ".t-dialog button"],
+            "alert_message": ["#popup_message", ".t-dialog__body"],
             "result_area": ["form.t-form", "body"],
         },
         "result_keywords": {
@@ -223,6 +244,29 @@ class Config:
     def workdir(self) -> Path:
         return self.path("workdir")
 
+    # -- 平台页面模式 -------------------------------------------------------
+    @property
+    def platform_mode(self) -> str:
+        """legacy = 旧版普通 HTML 页面；spa = 新版 Vue 单页应用。"""
+        mode = str(self.get("platform.mode", "legacy") or "legacy").strip().lower()
+        return mode if mode in {"legacy", "spa"} else "legacy"
+
+    def selectors(self) -> dict[str, Any]:
+        """当前模式对应的选择器表。
+
+        两种模式的页面结构完全不同，所以选择器是两套，由 mode 决定用哪套。
+        """
+        key = ("platform.legacy_selectors" if self.platform_mode == "legacy"
+               else "platform.selectors")
+        return self.section(key)
+
+    @property
+    def start_url(self) -> str:
+        """当前模式该打开的入口地址。"""
+        if self.platform_mode == "legacy":
+            return str(self.get("platform.home_url"))
+        return str(self.get("platform.spa_url") or self.get("platform.home_url"))
+
     @property
     def out_dir(self) -> Path:
         """结果输出目录。
@@ -269,10 +313,18 @@ class Config:
         except (TypeError, ValueError):
             problems.append("verify.min_interval_seconds 不是数字")
 
-        sel = self.section("platform.selectors")
+        if str(self.get("platform.mode", "legacy")).lower() not in {"legacy", "spa"}:
+            problems.append("platform.mode 只能是 legacy 或 spa")
+
+        sel = self.selectors()
         for need in ("invoice_number", "captcha_input", "submit"):
             if not sel.get(need):
-                problems.append(f"platform.selectors.{need} 不能为空")
+                problems.append(
+                    f"platform.{'legacy_selectors' if self.platform_mode == 'legacy' else 'selectors'}"
+                    f".{need} 不能为空")
+
+        if self.get("verify.enabled", True) and not self.start_url.startswith("http"):
+            problems.append(f"平台入口地址必须以 http 开头，当前是 {self.start_url!r}")
 
         if not self.workdir.is_dir():
             problems.append(f"发票目录不存在：{self.workdir}")
