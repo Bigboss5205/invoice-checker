@@ -79,8 +79,16 @@ DEFAULTS: dict[str, Any] = {
         "save_debug_text": False,  # 桌面版默认不落调试文本，保持目录干净
     },
     "captcha": {
-        "auto_ocr": True,
-        "max_auto_attempts": 8,    # 自动识别最多试几次（每次刷新一张新验证码）
+        # 默认关闭自动识别，全部走人工弹窗。
+        #
+        # 原因：这个平台的验证码是「从彩色字符里挑出指定颜色」的那种
+        # （提示会写「请输入验证码图片中蓝色文字」/「…红色文字」，颜色还会变），
+        # 字符又是中文与字母混排。自动识别成功率很低，与其每张票白等
+        # 几轮重试，不如直接弹窗让你敲 4 个字符——又快又不会认错。
+        #
+        # 想试试自动识别就改成 true（认不出仍会转人工，不会卡住）。
+        "auto_ocr": False,
+        "max_auto_attempts": 6,    # 仅在 auto_ocr=true 时有意义
         "manual_timeout_seconds": 180,
         "manual_max_rounds": 3,    # 人工最多被要求输入几次
     },

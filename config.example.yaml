@@ -36,8 +36,11 @@ extract:
   save_debug_text: false    # 把识别到的原始文本存到「发票查验出错现场」目录
 
 captcha:
-  auto_ocr: true            # 自动识别验证码
-  max_auto_attempts: 8      # 自动识别最多试几次（每次刷新一张新验证码）
+  # 默认「全部人工输入」——平台验证码是「挑出指定颜色的字符」且中英混排，
+  # 自动识别成功率很低，与其每张白等几轮重试，不如直接弹窗敲 4 个字符。
+  # 想试试自动识别就改成 true（认不出仍会转人工，不会卡住）。
+  auto_ocr: false
+  max_auto_attempts: 6      # 仅在 auto_ocr: true 时有意义
   manual_timeout_seconds: 180
   manual_max_rounds: 3      # 人工最多被问几次（点「跳过」会换一张再问）
 
