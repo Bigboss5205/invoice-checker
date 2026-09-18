@@ -1,0 +1,32 @@
+# =============================================================================
+#  发票批量查验（Windows 桌面版）—— 运行依赖
+#
+#  一般不用手动装：直接跑 .\build.ps1 会自动在 .build-venv 里装好并打包。
+#
+#  想从源码直接运行：
+#      pip install -r requirements.txt
+#      playwright install chromium     # 没有 Edge/Chrome 时才需要
+#      python 发票查验.pyw
+# =============================================================================
+
+# ---- 配置 ----
+PyYAML>=6.0,<7.0
+
+# ---- 发票文件解析 ----
+pdfplumber>=0.11,<1.0        # PDF 文本层抽取
+pypdfium2>=4.30,<5.0         # 无文本层 PDF 渲染成图片（自带 PDFium，无需 poppler）
+Pillow>=10.0,<12.0
+defusedxml>=0.7,<1.0         # XML 安全解析（防实体爆炸）
+
+# ---- 浏览器自动化 ----
+# 默认驱动系统自带的 Edge，不额外下载 Chromium；
+# 若目标机器没有 Edge/Chrome，需要执行 playwright install chromium。
+playwright>=1.48,<2.0
+
+# ---- 验证码自动识别（可选） ----
+# 打包时用 -NoOcr 可以去掉这一组，体积少约 200MB，
+# 代价是验证码全部要人工输入（功能不受影响）。
+ddddocr>=1.4.6,<2.0
+
+# ---- 打包 ----
+pyinstaller>=6.10,<7.0

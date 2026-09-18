@@ -1,0 +1,126 @@
+# =============================================================================
+#  发票批量查验 —— 配置（可选）
+#
+#  把本文件改名为 config.yaml，放到「发票查验.exe」旁边即可生效。
+#  **没有这个文件程序也能跑**：默认就查程序自己所在的目录。
+#
+#  改完保存，程序每次开始查验时会重新读取，不用重装。
+#  最常需要动的只有两处：
+#    1) paths.workdir             —— 发票不在程序目录时指过去
+#    2) verify.min_interval_seconds —— 查验间隔（平台有频率风控，别调太小）
+# =============================================================================
+
+paths:
+  # 发票所在目录。"." 表示程序所在目录。也可以用绝对路径。
+  workdir: "."
+  db: "发票查验记录.sqlite3"      # 查验历史（SQLite）
+  log: "发票查验日志.txt"          # 出问题先看这个
+
+scan:
+  extensions: [".pdf", ".ofd", ".xml", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"]
+  recursive: false          # 是否连子目录一起查
+  skip_verified: true       # 已有「-已查验」结果的就跳过，重复运行不会白跑
+  stable_seconds: 1
+
+output:
+  suffix: "-已查验"          # 结果命名：<原文件名>-已查验.pdf
+  pdf: true                 # 导出查验结果 PDF
+  overwrite: true           # 同名结果已存在时覆盖（false 则自动加 _2 _3）
+  record_txt: false         # 额外存一份纯文本记录
+  subfolder: ""             # 结果另存到子目录，例如 "已查验"；留空=与原发票同目录
+
+extract:
+  densify_digits: true      # 发票上数字常被排版插空格，先拼回去再识别
+  render_dpi: 220           # PDF 没有文本层时，渲染成图片的清晰度
+  image_ocr: true           # 图片类发票是否尝试 OCR
+  save_debug_text: false    # 把识别到的原始文本存到「发票查验出错现场」目录
+
+captcha:
+  auto_ocr: true            # 自动识别验证码
+  max_auto_attempts: 8      # 自动识别最多试几次（每次刷新一张新验证码）
+  manual_timeout_seconds: 180
+  manual_max_rounds: 3      # 人工最多被问几次（点「跳过」会换一张再问）
+
+verify:
+  enabled: true
+  driver: playwright        # playwright=真实查验；fake=离线演练（结果全是模拟的）
+  headless: true            # false 会弹出真实浏览器窗口（想亲眼看平台页面时用）
+  browser_channel: msedge   # msedge | chrome | chromium | auto（按顺序自动尝试）
+  nav_timeout_ms: 45000
+  result_timeout_ms: 30000
+  min_interval_seconds: 8   # 两张票之间最小间隔。平台有风控，不建议小于 5
+  max_attempts: 2           # 同一张票整体重试次数
+  stop_on_consecutive_failures: 0   # >0 时连续失败这么多次自动停下（0=不停）
+
+ui:
+  auto_start: false         # 打开程序就自动开始
+  log_lines: 400
+
+platform:
+  # 入口必须用这个**根地址**。
+  # 实测：直接访问 /national-invoice-check 路由会让懒加载的 chunk 取回 index.html
+  # （服务器对不存在的资源返回 200 + HTML），浏览器当 JS 解析就报错、整页白屏。
+  # 从根地址进入，SPA 自己会路由到查验页。
+  home_url: "https://inv-veri.chinatax.gov.cn/fpcygzfw/"
+
+  # ---------------------------------------------------------------------------
+  #  元素定位：每个字段给一组候选，按顺序找第一个可见的。
+  #  下面是 2026-09 **对着真实站点实测**出来的结构（TDesign 组件库，
+  #  类名带语义、比较稳定）。平台改版后跑 scripts/discover.py 重新抓一份。
+  # ---------------------------------------------------------------------------
+  selectors:
+    invoice_number:
+      - ".t-form-item__fphm input"
+      - "input[placeholder*='发票号码']"
+    invoice_code:
+      - ".t-form-item__fpdm input"
+      - "input[placeholder*='发票代码']"
+    invoice_date:
+      - ".t-form-item__kprq input"
+      - "input[placeholder='YYYYMMDD']"
+    # 第 4 个字段的**标签是动态的**：
+    #   开具金额(不含税) / 校验码 / 价税合计
+    # 所以先定位「表单项」读标签，再决定填什么值。
+    value_item:
+      - ".t-form-item__kpje"
+      - ".t-form-item__kjh"
+    value_input:
+      - ".t-form-item__kpje input"
+      - ".t-form-item__kjh input"
+    value_label:
+      - ".t-form__label"
+    captcha_input:
+      - ".t-form-item__yzm input"
+      - "input[placeholder*='验证码']"
+    captcha_image:
+      - "form.t-form img"
+      - "img[src*='captcha']"
+    captcha_refresh:
+      - ".form-box-tip__yzm"
+      - "text=点击图片刷新"
+    # 查验按钮：class 含 t-button 且 type=submit 的只有它
+    # （扫描/导入的类名是 button-span，重置是 type=reset）
+    submit:
+      - "button.t-button[type='submit']"
+      - "button:has-text('查 验')"
+    # 日期面板（开票日期是只读的日历选择器，只能点选）
+    date_year_select:
+      - ".t-date-picker__header-controller-year input"
+    date_month_select:
+      - ".t-date-picker__header-controller-month input"
+    date_option:
+      - ".t-select-option"
+    date_cell:
+      - ".t-date-picker__cell"
+    result_area:
+      - "form.t-form"
+      - "body"
+
+  # 平台返回文案 → 结论。匹配是「包含」关系，从上往下第一个命中生效。
+  # 结论优先取自 queryFpcyxx 接口返回的 CyjgMsg（更早更准），页面文本兜底。
+  result_keywords:
+    captcha_wrong: ["验证码错误", "验证码不正确", "验证码有误"]
+    rate_limited: ["超过该张发票当日查验次数", "查验次数已达上限", "访问过于频繁"]
+    not_found: ["查无此票", "未查到", "查验失败"]
+    mismatch: ["不一致", "不符"]
+    ok: ["查验成功", "查验一致", "信息一致"]

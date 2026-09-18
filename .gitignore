@@ -1,0 +1,28 @@
+# 打包与构建产物
+.build-venv/
+build/
+dist/
+*.spec
+
+# 运行时产物（发票查验会生成这些）
+__pycache__/
+*.py[cod]
+发票查验记录.sqlite3*
+发票查验日志.txt*
+发票查验出错现场/
+已查验/
+*-已查验.pdf
+*-已查验.txt
+
+# 平台探测产物
+discover.json
+discover.png
+
+# 本地配置（示例文件才是要进版本库的）
+config.yaml
+
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
