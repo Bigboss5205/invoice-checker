@@ -90,6 +90,22 @@ def parse_color_hint(text: str) -> str | None:
     return None
 
 
+# 内部名字 → 中文，给界面提示用
+_COLOR_ZH: dict[str, str] = {
+    "blue": "蓝色",
+    "red": "红色",
+    "green": "绿色",
+    "black": "黑色",
+}
+
+
+def color_label(color: str | None) -> str:
+    """把内部颜色名转成中文（用于弹窗文案）。认不出就原样返回。"""
+    if not color:
+        return ""
+    return _COLOR_ZH.get(str(color), str(color))
+
+
 def _build() -> Any:
     import ddddocr  # type: ignore
 
