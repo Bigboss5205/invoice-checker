@@ -879,6 +879,57 @@ def check_gui() -> bool:
 
     ok &= check("验证码长度不固定", captcha_lengths)
 
+    def captcha_color_hint():
+        """人工弹窗必须显示「只填哪种颜色」。
+
+        回归用例：驱动曾经**只在自动识别分支里**读颜色，人工分支根本没读，
+        弹窗上一个颜色提示都没有——而图里混着好几种颜色的字符，
+        用户不知道该填哪些字（何况浏览器默认无头，连平台页面都看不到）。
+        """
+        from PIL import Image
+
+        from app.gui import CaptchaDialog, _Answer
+
+        import io as _io
+
+        img = Image.new("RGB", (120, 50), (255, 255, 255))
+        for x in range(5, 35):
+            for y in range(10, 40):
+                img.putpixel((x, y), (0, 0, 255))        # 蓝色文字（该填的）
+        for x in range(60, 90):
+            for y in range(10, 40):
+                img.putpixel((x, y), (255, 0, 0))        # 红色干扰（不该填）
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+
+        box = _Answer()
+        dlg = CaptchaDialog(win, {
+            "task_id": "t-color", "png": buf.getvalue(), "filename": "x.pdf",
+            "hint": "", "timeout": 30,
+            "color": "blue", "color_text": "请输入验证码图片中蓝色文字",
+        }, box)
+        root.update()
+
+        shown = dlg.color_label.cget("text")
+        assert "蓝色" in shown, f"弹窗应显示「只填蓝色文字」，实际：{shown!r}"
+        assert dlg.iso_label is not None, "应给出按颜色分离后的对照图"
+        assert dlg.iso_label.image is not None, "分离对照图没有真正渲染"
+        dlg._skip()
+
+        # 读不到颜色时也要有兜底说明，不能让用户干瞪眼
+        box2 = _Answer()
+        dlg2 = CaptchaDialog(win, {"task_id": "t-nc", "png": buf.getvalue(),
+                                   "filename": "x.pdf", "hint": "",
+                                   "timeout": 30}, box2)
+        root.update()
+        fallback = dlg2.color_label.cget("text")
+        assert "颜色" in fallback, f"没颜色时也要提示照平台颜色填，实际：{fallback!r}"
+        assert dlg2.iso_label is None, "没有颜色时不该画出分离图"
+        dlg2._skip()
+        return f"显示「{shown}」+ 分离对照图；读不到颜色时兜底提示正常"
+
+    ok &= check("验证码颜色提示上屏", captcha_color_hint)
+
     def captcha_skip():
         from app.gui import CaptchaDialog, _Answer
         from app.verify.fake import _placeholder_png
@@ -1232,9 +1283,12 @@ def check_legacy_mode() -> bool:
     class Stub:
         def __init__(self):
             self.calls = 0
+            self.colors: list = []
 
-        def request(self, task_id, png, *, filename="", hint="", timeout=180.0):
+        def request(self, task_id, png, *, filename="", hint="", timeout=180.0,
+                    color=None, color_text=""):
             self.calls += 1
+            self.colors.append((color, color_text))
             return "ZZZZ"        # 故意错：验证「弹窗报错 → 关闭 → 重试」
 
     stub = Stub()
@@ -1317,7 +1371,8 @@ def check_legacy_mode() -> bool:
 
     def full_legacy_flow():
         """旧版完整走一遍：填表 → 取码 → 提交 → 读弹窗结论。"""
-        flow = PlaywrightVerifier(cfg, Stub())
+        stub = Stub()
+        flow = PlaywrightVerifier(cfg, stub)
         flow.start()
         try:
             outcome = flow.verify("legacy-full", dict(_LEGACY_INPUTS),
@@ -1326,7 +1381,16 @@ def check_legacy_mode() -> bool:
             flow.close()
         assert outcome.status == "captcha_wrong", \
             f"完整流程应判 captcha_wrong，实际 {outcome.status}：{outcome.summary}"
-        return f"端到端跑通：{outcome.status} / {outcome.summary}"
+        assert stub.calls == 1, f"人工验证码应被调用 1 次，实际 {stub.calls}"
+        # 关键回归：人工弹窗必须拿到「只填蓝色文字」这条提示。
+        # 曾经只在自动识别分支里读颜色，人工分支根本读不到——
+        # 而图里混着多种颜色，用户不知道填哪种就只能瞎猜。
+        got_color, got_text = stub.colors[0]
+        assert got_color == "blue", \
+            f"应从「请输入验证码图片中蓝色文字」读出 blue，实际 {got_color!r}"
+        assert "蓝色" in got_text, f"提示原文要带给弹窗显示，实际 {got_text!r}"
+        return (f"端到端跑通：{outcome.status} / {outcome.summary}；"
+                f"颜色提示已传到人工弹窗（{got_color}）")
 
     # 先关掉上一个驱动：Playwright 同步 API 同线程不能有两个实例
     try:
@@ -1567,9 +1631,12 @@ def check_driver() -> bool:
         class StubPrompter:
             def __init__(self):
                 self.calls = 0
+                self.colors: list = []
 
-            def request(self, task_id, png, *, filename="", hint="", timeout=180.0):
+            def request(self, task_id, png, *, filename="", hint="", timeout=180.0,
+                        color=None, color_text=""):
                 self.calls += 1
+                self.colors.append((color, color_text))
                 return "AB12"
 
         stub = StubPrompter()
