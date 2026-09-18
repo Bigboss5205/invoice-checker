@@ -842,14 +842,42 @@ def check_gui() -> bool:
         root.update()
         assert dlg.winfo_exists(), "验证码弹窗没建起来"
 
-        dlg.entry.insert(0, "ab12")
-        dlg._on_key(type("_Evt", (), {"keysym": "1"})())   # 触发大写化 + 满 4 位自动提交
+        dlg.entry.insert(0, "ab1")
+        dlg._on_key(type("_Evt", (), {"keysym": "1"})())   # 只做大写化
+        root.update()
+        # 回归用例：曾经写成「满 4 位自动提交」，但平台验证码**位数不固定**，
+        # 所以输入过程中绝不能自动提交。
+        assert not box.event.is_set(), "不该因为长度就自动提交（验证码位数不固定）"
+        assert dlg.entry.get() == "AB1", f"应转成大写，实际 {dlg.entry.get()!r}"
+
+        dlg._submit()                                       # 显式提交
         root.update()
         assert box.event.wait(2), "提交后没有唤醒等待方"
-        assert box.value == "AB12", f"应返回大写验证码，实际 {box.value!r}"
-        return "可提交，返回 AB12 并唤醒工作线程"
+        assert box.value == "AB1", f"应返回大写验证码，实际 {box.value!r}"
+        return "3 位也能提交，且输入过程中不会自动提交"
 
     ok &= check("验证码弹窗（人工兜底）", captcha_flow)
+
+    def captcha_lengths():
+        """验证码位数不固定：短的、长的都要能正常提交。"""
+        from app.gui import CaptchaDialog, _Answer
+        from app.verify.fake import _placeholder_png
+
+        results = []
+        for code in ("AB", "AB1", "AB12", "AB12CD", "AB12CDE"):
+            box = _Answer()
+            dlg = CaptchaDialog(win, {"task_id": f"t-{code}", "png": _placeholder_png(),
+                                      "filename": "x.pdf", "hint": "",
+                                      "timeout": 30}, box)
+            root.update()
+            dlg.entry.insert(0, code)
+            dlg._submit()
+            assert box.event.wait(2), f"{code!r} 没有提交成功"
+            assert box.value == code, f"应原样返回 {code!r}，实际 {box.value!r}"
+            results.append(str(len(code)))
+        return f"长度 {', '.join(results)} 位全部原样提交"
+
+    ok &= check("验证码长度不固定", captcha_lengths)
 
     def captcha_skip():
         from app.gui import CaptchaDialog, _Answer
