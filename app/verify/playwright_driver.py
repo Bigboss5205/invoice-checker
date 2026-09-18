@@ -377,10 +377,18 @@ class PlaywrightVerifier(BaseVerifier):
             else:
                 manual_left -= 1
                 source = "manual"
+                # 人工这条路更要读颜色：图里混着好几种颜色的字符，
+                # 弹窗必须把「只填蓝色/红色」告诉用户，否则只能瞎猜。
+                color, hint_text = self._read_captcha_hint(page)
+                if color:
+                    log.info("本次验证码要求填%s色文字", captcha_ocr.color_label(color))
+                else:
+                    log.info("未能从页面读出验证码颜色提示（原文：%r）", hint_text)
                 log.info("转人工输入验证码（%s）", filename or task_id)
                 text = self.prompter.request(
                     task_id, png, filename=filename, hint=invoice_hint,
-                    timeout=self.manual_timeout)
+                    timeout=self.manual_timeout,
+                    color=color, color_text=hint_text)
                 if text is None:
                     if manual_left > 0:
                         log.info("人工未输入，刷新验证码后重试（还剩 %d 次）", manual_left)
@@ -947,32 +955,46 @@ class PlaywrightVerifier(BaseVerifier):
                 continue
         return False
 
-    def _read_captcha_color(self, page) -> str | None:
-        """从页面提示里读出「这次的验证码要填哪个颜色」。
+    def _read_captcha_hint(self, page) -> tuple[str | None, str]:
+        """读出「这次的验证码要填哪个颜色」，以及页面上那句提示原文。
 
         平台提示形如「请输入验证码图片中蓝色文字」/「…红色文字」，
         **颜色是会变的**（实测蓝、红都出现过），所以每次都要现读。
         写死一种颜色会把另一类验证码全部认错，还不如不做分离。
+
+        返回 ``(颜色名或 None, 提示原文)``。原文要一路传到人工弹窗上——
+        图里混着几种颜色的字符，不告诉用户填哪种就等于让他瞎猜。
         """
-        # 先看提示元素
+        best_text = ""
         for name in ("captcha_hint", "captcha_input"):
             loc = self._locator(page, name, wait_ms=400)
             if loc is None:
                 continue
             try:
-                text = loc.inner_text() or ""
+                text = (loc.inner_text() or "").strip()
             except Exception:
                 continue
+            if "验证码" in text and not best_text:
+                best_text = text
             color = captcha_ocr.parse_color_hint(text)
             if color:
-                return color
+                return color, text
 
         # 兜底：整页文本里找一次
         body = self._body_text(page)
         index = body.find("验证码图片中")
         if index >= 0:
-            return captcha_ocr.parse_color_hint(body[index:index + 20])
-        return None
+            snippet = body[index:index + 24].strip()
+            if not best_text:
+                best_text = snippet
+            color = captcha_ocr.parse_color_hint(snippet)
+            if color:
+                return color, snippet
+        return None, best_text
+
+    def _read_captcha_color(self, page) -> str | None:
+        """只要颜色（自动识别那条路用）。"""
+        return self._read_captcha_hint(page)[0]
 
     def _refresh_captcha(self, page) -> bool:
         for name in ("captcha_refresh", "captcha_image"):
