@@ -17,14 +17,32 @@ import logging
 import threading
 from typing import Callable
 
+from . import ocr as captcha_ocr
+
 log = logging.getLogger(__name__)
+
+
+def captcha_hint_text(color: str | None, color_text: str = "") -> str:
+    """把「该填哪种颜色」拼成一句给人看的话。
+
+    平台的提示是「请输入验证码图片中蓝色文字」——**颜色会变**（蓝/红都出现过），
+    而且图里混着好几种颜色的字符，只该填指定颜色的那些。
+    所以这句提示必须显示给用户，不能只写进 debug 日志。
+    """
+    label = captcha_ocr.color_label(color)
+    if label:
+        return f"这张图里有多种颜色，只填【{label}】的字符。"
+    if color_text:
+        return f"平台提示：{color_text}（程序没能读出颜色，请照这句提示填）"
+    return "这张图里有多种颜色，只填平台指定颜色的字符（拿不准就点「跳过 / 换一张」）。"
 
 
 class NullPrompter:
     """不提供人工输入。自动识别失败即放弃。"""
 
     def request(self, task_id: str, png: bytes, *, filename: str = "",
-                hint: str = "", timeout: float = 180.0) -> str | None:
+                hint: str = "", timeout: float = 180.0,
+                color: str | None = None, color_text: str = "") -> str | None:
         log.info("任务 %s 需要人工验证码，但当前未启用人工输入", task_id)
         return None
 
@@ -36,7 +54,8 @@ class ConsolePrompter:
         self.save_dir = save_dir
 
     def request(self, task_id: str, png: bytes, *, filename: str = "",
-                hint: str = "", timeout: float = 180.0) -> str | None:
+                hint: str = "", timeout: float = 180.0,
+                color: str | None = None, color_text: str = "") -> str | None:
         path = ""
         if self.save_dir is not None and png:
             try:
@@ -55,6 +74,8 @@ class ConsolePrompter:
             print(f"发票：{hint}")
         if path:
             print(f"验证码图片：{path}")
+        # 颜色提示必须打出来：这张图里混着好几种颜色，只填指定的那种
+        print(captcha_hint_text(color, color_text))
         print("=" * 56)
         try:
             text = input("请输入验证码（直接回车 = 跳过）: ").strip()
@@ -66,7 +87,8 @@ class ConsolePrompter:
 class CallbackPrompter:
     """把请求交给外部回调。
 
-    回调签名：``fn(task_id, png, filename, hint, timeout) -> str | None``
+    回调签名：``fn(task_id, png, filename, hint, timeout, color, color_text)
+    -> str | None``
     回调内部应负责线程切换（GUI 场景），并保证在 timeout 之前返回或返回 None。
     """
 
@@ -74,10 +96,12 @@ class CallbackPrompter:
         self._fn = fn
 
     def request(self, task_id: str, png: bytes, *, filename: str = "",
-                hint: str = "", timeout: float = 180.0) -> str | None:
+                hint: str = "", timeout: float = 180.0,
+                color: str | None = None, color_text: str = "") -> str | None:
         try:
             return self._fn(task_id=task_id, png=png, filename=filename,
-                            hint=hint, timeout=timeout)
+                            hint=hint, timeout=timeout,
+                            color=color, color_text=color_text)
         except Exception as exc:
             log.warning("人工验证码回调出错：%s", exc)
             return None
@@ -103,13 +127,15 @@ class ThreadEventPrompter:
         self.on_ask: Callable[[dict], None] | None = None  # GUI 侧注册
 
     def request(self, task_id: str, png: bytes, *, filename: str = "",
-                hint: str = "", timeout: float = 180.0) -> str | None:
+                hint: str = "", timeout: float = 180.0,
+                color: str | None = None, color_text: str = "") -> str | None:
         with self._lock:
             self._answer = None
             self._event.clear()
             self._pending = {
                 "task_id": task_id, "png": png, "filename": filename,
                 "hint": hint, "timeout": timeout,
+                "color": color, "color_text": color_text,
             }
             payload = dict(self._pending)
 
