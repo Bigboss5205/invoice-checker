@@ -22,6 +22,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
+from .captcha import ocr as captcha_ocr
+from .captcha.prompt import captcha_hint_text
 from .config import Config, load_config
 from .runner import FileResult, RunReport, Runner
 
@@ -32,6 +34,14 @@ COLOR_OK = "#1a7f37"
 COLOR_BAD = "#cf222e"
 COLOR_WARN = "#bf8700"
 COLOR_DIM = "#6b7280"
+
+# 颜色提示在界面上要真的用那个颜色显示，这样一眼就能对上
+_COLOR_FG = {
+    "blue": "#0b5cd5",
+    "red": "#cf222e",
+    "green": "#1a7f37",
+    "black": "#111827",
+}
 
 _STATUS_TAG = {
     "ok": "ok", "mismatch": "bad", "not_found": "bad",
@@ -85,12 +95,14 @@ class TkUi:
         return self._stop.is_set()
 
     def request(self, task_id: str, png: bytes, *, filename: str = "",
-                hint: str = "", timeout: float = 180.0) -> str | None:
+                hint: str = "", timeout: float = 180.0,
+                color: str | None = None, color_text: str = "") -> str | None:
         """要一个验证码。工作线程会在这里阻塞，直到主线程弹窗有了结果。"""
         box = _Answer()
         self.queue.put(("captcha", {
             "task_id": task_id, "png": png, "filename": filename,
             "hint": hint, "timeout": timeout,
+            "color": color, "color_text": color_text,
         }, box))
         if not box.event.wait(timeout + 10):
             log.warning("等待验证码输入超时")
@@ -143,12 +155,47 @@ class CaptchaDialog(tk.Toplevel):
             ttk.Label(body, text=f"发票：{payload['hint']}",
                       foreground=COLOR_DIM).pack(anchor="w", pady=(2, 0))
 
-        img_frame = ttk.Frame(body)
-        img_frame.pack(pady=14)
-        self.image_label = ttk.Label(img_frame, relief="solid", borderwidth=1)
+        # 颜色提示放在最上面：平台要求「只填蓝色 / 红色文字」，
+        # 而图里混着好几种颜色的字符——不先看到这句就只能瞎猜。
+        color = payload.get("color")
+        color_key = str(color) if color else ""
+        color_text = payload.get("color_text") or ""
+
+        self.color_label = ttk.Label(
+            body, text=captcha_hint_text(color, color_text),
+            font=("Microsoft YaHei UI", 10, "bold"),
+            foreground=_COLOR_FG.get(color_key, COLOR_WARN),
+            wraplength=460, justify="left")
+        self.color_label.pack(anchor="w", pady=(6, 0))
+
+        # 左：原图（点一下换一张）；右：按提示颜色分离出来的图，该填的就是这些字
+        shots = ttk.Frame(body)
+        shots.pack(pady=10)
+
+        left = ttk.Frame(shots)
+        left.pack(side="left")
+        ttk.Label(left, text="原图（点图可换一张）",
+                  foreground=COLOR_DIM).pack()
+        self.image_label = ttk.Label(left, relief="solid", borderwidth=1)
         self.image_label.pack()
         self._render_image(payload.get("png") or b"")
         self.image_label.bind("<Button-1>", lambda _e: self._skip())
+
+        self.iso_label = None
+        isolated = None
+        if color_key and payload.get("png"):
+            try:
+                isolated = captcha_ocr.color_filter(payload["png"], color_key)
+            except Exception as exc:
+                log.debug("验证码颜色分离失败：%s", exc)
+        if isolated:
+            right = ttk.Frame(shots)
+            right.pack(side="left", padx=(12, 0))
+            ttk.Label(right, text=f"只填这些（{captcha_ocr.color_label(color)}）",
+                      foreground=_COLOR_FG.get(color_key, COLOR_DIM)).pack()
+            self.iso_label = ttk.Label(right, relief="solid", borderwidth=1)
+            self.iso_label.pack()
+            self._render_image_into(self.iso_label, isolated)
 
         ttk.Label(body, text="请输入图中的字符（按回车，或点下面的「提交」）",
                   foreground=COLOR_DIM).pack(anchor="w")
@@ -174,17 +221,21 @@ class CaptchaDialog(tk.Toplevel):
         self._tick()
 
     def _render_image(self, png: bytes) -> None:
+        self._render_image_into(self.image_label, png)
+
+    def _render_image_into(self, label: ttk.Label, png: bytes,
+                           max_px: int = 240) -> None:
         try:
             photo = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
-            factor = max(1, min(4, 240 // max(1, photo.width())))
+            factor = max(1, min(4, max_px // max(1, photo.width())))
             if factor > 1:
                 photo = photo.zoom(factor)
-            self.image_label.configure(image=photo)
-            self.image_label.image = photo      # 必须留引用，否则被回收变白
+            label.configure(image=photo)
+            label.image = photo      # 必须留引用，否则被回收变白
         except Exception as exc:
             log.debug("验证码图片显示失败：%s", exc)
-            self.image_label.configure(text="（验证码图片无法显示，请点「跳过」重试）",
-                                       padding=20)
+            label.configure(text="（验证码图片无法显示，请点「跳过」重试）",
+                            padding=20)
 
     def _on_key(self, event) -> None:
         """只做「去空格 + 转大写」，**不自动提交**。
