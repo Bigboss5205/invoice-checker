@@ -1287,9 +1287,9 @@ def mock_legacy_result_page() -> str:
 <html lang="zh-CN"><head><meta charset="utf-8"><title>查验结果</title></head>
 <body>
 <div class="result-box">
-  <span>结果：</span><span id="jg"></span>
-  <span>查验时间：</span><span id="time"></span>
-  <button id="print">打印</button><button id="close">关闭</button>
+  <span>结果： <strong id="cyjg"></strong>
+    <span id="cysj">查验时间：2026-09-19 10:35:00</span></span>
+  <button id="printfp">打印</button><button id="close">关闭</button>
 </div>
 <table>
   <tr><td>发票代码：</td><td id="fpdm"></td></tr>
@@ -1299,8 +1299,7 @@ def mock_legacy_result_page() -> str:
 <div id="note">说明：发票信息不符时不得作为财务报销凭证，任何单位和个人有权拒收并举报！</div>
 <script>
   var q = new URLSearchParams(location.search);
-  document.getElementById('jg').textContent = q.get('jg') || '';
-  document.getElementById('time').textContent = q.get('time') || '';
+  document.getElementById('cyjg').textContent = q.get('jg') || '';
   document.getElementById('fpdm').textContent = q.get('fpdm') || '';
   document.getElementById('fphm').textContent = q.get('fphm') || '';
   document.getElementById('kprq').textContent = q.get('kprq') || '';
@@ -1579,6 +1578,38 @@ def check_legacy_mode() -> bool:
                 f"PDF 从结果窗口导出（{len(outcome.pdf_bytes) // 1024} KB）")
 
     ok &= check("旧版成功：结论在弹出窗口里", full_legacy_success)
+
+    def result_in_iframe():
+        """回归：结果页也可能被装进 **iframe**，而不是新窗口。
+
+        实测证据：提交后只出现一个 ``GET …/jgbyz.html`` 的 document 请求，
+        主页面跳转 0 次，也没有新窗口事件——那就只能是 iframe。
+        而 ``page.inner_text("body")`` **读不到 iframe 里的内容**，
+        只看主页面自然什么都找不到。
+        """
+        host = tmpdir / "framehost.html"
+        host.write_text(
+            "<!doctype html><html><body>"
+            "<iframe id='fr' width='800' height='400' "
+            "src='jgbyz.html?jg=%E4%B8%80%E8%87%B4'></iframe>"
+            "</body></html>", encoding="utf-8")
+
+        flow = PlaywrightVerifier(cfg, Stub())
+        flow.start()
+        try:
+            page = flow._ensure_page()
+            page.goto(host.as_uri(), wait_until="load", timeout=30000)
+            page.wait_for_timeout(1200)
+            status, summary, _body = flow._wait_result(page, "")
+            owner = flow._result_page
+        finally:
+            flow.close()
+
+        assert status == "ok", f"iframe 里的结论没读到：{status} / {summary}"
+        assert owner is not None, "应记下结论所在页面（导 PDF 要用）"
+        return f"iframe 里的结论被读到：{status} / {summary}（PDF 目标页已记下）"
+
+    ok &= check("结论在 iframe 里也能读到", result_in_iframe)
 
     try:
         target.unlink()
