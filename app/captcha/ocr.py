@@ -43,21 +43,41 @@ _JUNK = set(" \t\n\r=+*_-.,:;'\"`~^<>[]{}()\\/|")
 # 分离后至少要留下这么多像素，才认为「这张图确实是该颜色文字」
 _MIN_PIXELS = 20
 
-# 颜色判定：目标通道要比其他通道明显高
-_MARGIN = 25
-_MIN_LEVEL = 90
+# 颜色判定。
+#
+# 这里有个真实踩过的坑：平台验证码的底色是一大片**灰粉色**
+# （实测 RGB 183,117,131，占整张图 59% 的像素，另有 15% 是浅紫 228,218,243）。
+# 灰粉色的红通道也比绿蓝高，所以「r 高于 g/b 就算红」这条规则会把整片底色
+# 全选进来——按红色分离出来的是**一整块黑**，真正的红字反而被淹没。
+# 蓝字没这个问题（底色偏红，不满足「蓝色主导」），于是表现成
+# 「只有蓝色能分出来，红色/其他颜色就一团黑」。
+#
+# 修法：除了「目标通道主导」，再要求像素**足够鲜艳**（HSV 饱和度）。
+# 底色饱和度只有 0.36，纯红/纯蓝字是 1.0，一刀切得干净。
+_MARGIN = 30          # 目标通道要高出其他通道这么多
+_MIN_LEVEL = 90       # 太暗的交给「黑色」规则
+_MIN_SAT = 0.45       # 饱和度下限：把灰底、浅色底挡在外面
+
+
+def _sat(r: int, g: int, b: int) -> float:
+    """HSV 里的饱和度。底色那种「灰不灰红不红」的颜色饱和度很低。"""
+    mx = max(r, g, b)
+    return 0.0 if mx == 0 else (mx - min(r, g, b)) / mx
 
 
 def _is_blue(r: int, g: int, b: int) -> bool:
-    return b - max(r, g) >= _MARGIN and b >= _MIN_LEVEL
+    return (b >= _MIN_LEVEL and b - max(r, g) >= _MARGIN
+            and _sat(r, g, b) >= _MIN_SAT)
 
 
 def _is_red(r: int, g: int, b: int) -> bool:
-    return r - max(g, b) >= _MARGIN and r >= _MIN_LEVEL
+    return (r >= _MIN_LEVEL and r - max(g, b) >= _MARGIN
+            and _sat(r, g, b) >= _MIN_SAT)
 
 
 def _is_green(r: int, g: int, b: int) -> bool:
-    return g - max(r, b) >= 20 and g >= 80
+    return (g >= 80 and g - max(r, b) >= _MARGIN
+            and _sat(r, g, b) >= _MIN_SAT)
 
 
 def _is_black(r: int, g: int, b: int) -> bool:
