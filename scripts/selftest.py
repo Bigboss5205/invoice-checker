@@ -1064,6 +1064,54 @@ def check_captcha_ocr() -> bool:
 
     ok &= check("颜色分离（按提示取色）", blue_separation)
 
+    def real_captcha_background():
+        """回归：真实验证码的**灰粉色底**不能被当成红字。
+
+        实测抓下来的真图（120x50）像素统计：
+            183,117,131  × 3548   ← 灰粉色底，占 59%
+            228,218,243  ×  937   ← 浅紫底
+            0,0,255      ×   95   ← 蓝字
+            255,0,0      ×   91   ← 红字
+            0,0,0        ×   60   ← 黑字
+
+        旧规则「r 比其他通道高」会把 59% 的灰粉底全选成红字，
+        按红色分离出来的是一整块黑，红字反而看不见——
+        表现就是「只有蓝色能提取出来，要红色时就废了」。
+        """
+        from PIL import Image
+
+        import io as _io
+
+        bg = (183, 117, 131)          # 真图里占比最大的底色
+        img = Image.new("RGB", (40, 20), bg)
+        for x in range(2, 10):        # 一小块纯红字
+            for y in range(2, 10):
+                img.putpixel((x, y), (255, 0, 0))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        png = buf.getvalue()
+
+        red = ocr.color_filter(png, "red")
+        assert red, "有纯红字时应该能分离出红色"
+        out = Image.open(_io.BytesIO(red)).convert("RGB")
+        assert out.getpixel((35, 15)) == (255, 255, 255), \
+            "灰粉色底不该被当成红字（它会被整片涂黑，把真红字淹没）"
+        assert out.getpixel((5, 5)) == (0, 0, 0), "纯红字应该被保留并转成黑色"
+
+        kept = sum(1 for p in out.getdata() if p == (0, 0, 0))
+        assert kept <= 80, f"保留的像素应该只有那小块红字，实际 {kept}"
+
+        # 底色单独成图时，任何颜色都不该认出来
+        flat = Image.new("RGB", (40, 20), bg)
+        fbuf = _io.BytesIO()
+        flat.save(fbuf, format="PNG")
+        for name in ("red", "blue"):
+            assert ocr.color_filter(fbuf.getvalue(), name) is None, \
+                f"只有灰粉底时不该分离出{name}（否则预览是一整块黑）"
+        return "灰粉底(183,117,131)不再被误判为红字，纯红字仍能正确分离"
+
+    ok &= check("真实验证码底色不误判", real_captcha_background)
+
     if not ocr.available():
         record("SKIP", "ddddocr 初始化",
                "不可用 —— 验证码将全部转人工输入，功能不受影响")
