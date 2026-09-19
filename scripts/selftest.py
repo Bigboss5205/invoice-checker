@@ -1611,6 +1611,47 @@ def check_legacy_mode() -> bool:
 
     ok &= check("结论在 iframe 里也能读到", result_in_iframe)
 
+    def boilerplate_not_verdict():
+        """回归：结果页那句固定说明里的「不符」绝不能被当成「不一致」。
+
+        实测事故：平台结果页底部写着
+        「若发现发票查验结果与实际交易不符，任何单位或个人有权拒收并向当地税务机关举报。」
+        早先直接拿整页文本匹配关键词，「不符」命中了 mismatch，
+        于是**每一张真票都被报成「不一致」**——对发票工具来说这是最危险的误判。
+        """
+        from app.verify.playwright_driver import (classify,
+                                                  strip_result_boilerplate)
+        from app.config import load_config
+
+        cfg = load_config()
+        page_text = (
+            "结果：一致\n"
+            "查验时间：2026-09-19 11:34:40\n"
+            "发票号码：26152000000893717206\n"
+            "说明：若发现发票查验结果与实际交易不符，任何单位或个人有权拒收"
+            "并向当地税务机关举报。\n"
+        )
+        # 不处理就会误判
+        assert classify(page_text, cfg, "") == "mismatch", \
+            "这个用例本身要能复现误判，否则说明关键词变了"
+        # 处理之后必须是一致
+        clean = strip_result_boilerplate(page_text)
+        assert "不符" not in clean, f"固定说明没剔干净：{clean!r}"
+        assert classify(clean, cfg, "") == "ok", \
+            f"剔掉固定说明后应判一致，实际 {classify(clean, cfg, '')}"
+
+        # 另一种历史措辞也要能剔掉
+        old = "说明：发票信息不符时不得作为财务报销凭证，任何单位和个人有权拒收并举报！"
+        assert "不符" not in strip_result_boilerplate(old), "旧措辞没剔掉"
+
+        # 真正的「不一致」结论不能被误删
+        real = "结果：不一致\n查验时间：2026-09-19 11:34:40\n"
+        assert classify(strip_result_boilerplate(real), cfg, "") == "mismatch", \
+            "真正的「不一致」结论必须保留"
+        return "固定说明被按行剔掉：一致→一致，真实的不一致→不一致"
+
+    ok &= check("固定说明不误判成不一致", boilerplate_not_verdict)
+
     try:
         target.unlink()
         tmpdir.rmdir()
