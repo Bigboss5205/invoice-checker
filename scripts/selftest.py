@@ -1229,6 +1229,44 @@ _LEGACY_INPUTS = {
 }
 
 
+def mock_legacy_result_page() -> str:
+    """模拟旧版的**结果窗口**（jgbyz.html）。
+
+    这是实测发现的第五个坑，也是最坑的一个：
+    旧版查验成功后是用 ``window.open('jgbyz.html')`` 把结果开在**新窗口**里的，
+    主页面既不跳转、``queryFpcyxx`` 接口也不返回 JSON。
+    只盯主页面的实现会把一次**成功**的查验误判成「没能识别出结论」。
+
+    页面结构照真实结果页搭：
+    ``结果：一致`` 那一栏是关键；底部那句
+    「说明：发票信息不符时不得作为财务报销凭证…」是**固定说明、每张票都在**，
+    里面带「不符」——回归用例正是要保证它不会把结论带成「不一致」。
+    """
+    return """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>查验结果</title></head>
+<body>
+<div class="result-box">
+  <span>结果：</span><span id="jg"></span>
+  <span>查验时间：</span><span id="time"></span>
+  <button id="print">打印</button><button id="close">关闭</button>
+</div>
+<table>
+  <tr><td>发票代码：</td><td id="fpdm"></td></tr>
+  <tr><td>发票号码：</td><td id="fphm"></td></tr>
+  <tr><td>开票日期：</td><td id="kprq"></td></tr>
+</table>
+<div id="note">说明：发票信息不符时不得作为财务报销凭证，任何单位和个人有权拒收并举报！</div>
+<script>
+  var q = new URLSearchParams(location.search);
+  document.getElementById('jg').textContent = q.get('jg') || '';
+  document.getElementById('time').textContent = q.get('time') || '';
+  document.getElementById('fpdm').textContent = q.get('fpdm') || '';
+  document.getElementById('fphm').textContent = q.get('fphm') || '';
+  document.getElementById('kprq').textContent = q.get('kprq') || '';
+</script>
+</body></html>"""
+
+
 def mock_legacy_page() -> str:
     """按**实测的旧版页面结构**搭的模拟页（id 与真实站点完全一致）。
 
@@ -1281,10 +1319,20 @@ def mock_legacy_page() -> str:
     if (!/^\\d{8}$/.test(kprq.value)) { kprq.value = 'YYYYMMDD'; }
   });
   // 坑3：结论放在自绘弹窗里
+  // 坑5（最关键）：验证码**正确**时，平台把结果开在**新窗口**里，
+  //      主页面不跳转、也没有任何结论文字——只盯主页面的实现会误判成「结果未知」。
   document.getElementById('checkfp').addEventListener('click', function () {
     var y = document.getElementById('yzm').value.trim();
-    document.getElementById('popup_message').textContent =
-      (y === 'AB12') ? '查验成功，发票信息一致' : '验证码错误!';
+    if (y === 'AB12') {
+      window.open('jgbyz.html?jg=' + encodeURIComponent('一致')
+        + '&time=' + encodeURIComponent('2026-09-19 10:35:00')
+        + '&fpdm=' + encodeURIComponent(document.getElementById('fpdm').value)
+        + '&fphm=' + encodeURIComponent(document.getElementById('fphm').value)
+        + '&kprq=' + encodeURIComponent(document.getElementById('kprq').value),
+        '_blank', 'width=900,height=700');
+      return;
+    }
+    document.getElementById('popup_message').textContent = '验证码错误!';
     document.getElementById('popup_container').style.display = '';
     document.getElementById('popup_overlay').style.display = '';
   });
@@ -1319,6 +1367,10 @@ def check_legacy_mode() -> bool:
     tmpdir = Path(tempfile.mkdtemp(prefix="legacypage-"))
     target = tmpdir / "legacy.html"
     target.write_text(mock_legacy_page(), encoding="utf-8")
+    # 结果窗口（window.open 的目标）也必须真实存在，否则弹窗打不开、
+    # 就没法回归「结论在弹窗里」这个问题
+    (tmpdir / "jgbyz.html").write_text(mock_legacy_result_page(),
+                                       encoding="utf-8")
 
     cfg = load_config()
     cfg.data["verify"]["browser_channel"] = "msedge"
@@ -1448,6 +1500,44 @@ def check_legacy_mode() -> bool:
         ok = False
 
     ok &= check("旧版完整流程（端到端）", full_legacy_flow)
+
+    def full_legacy_success():
+        """验证码正确时：结论在**新窗口**里，必须读到，且 PDF 从那一页导出。
+
+        这是实测踩到的坑：旧版查验成功后用 window.open('jgbyz.html')
+        把结果开在新窗口，主页面不跳转、接口也不返回 JSON——
+        只盯主页面的实现会把一次**成功**的查验误判成「没能识别出结论」。
+        另外结果页底部那句固定说明「发票信息不符时不得作为财务报销凭证」
+        带「不符」，一度会把结论带成「不一致」。
+        """
+        class GoodStub:
+            def __init__(self):
+                self.calls = 0
+
+            def request(self, task_id, png, *, filename="", hint="",
+                        timeout=180.0, color=None, color_text=""):
+                self.calls += 1
+                return "AB12"        # 正确验证码
+
+        stub = GoodStub()
+        flow = PlaywrightVerifier(cfg, stub)
+        flow.start()
+        try:
+            outcome = flow.verify("legacy-ok", dict(_LEGACY_INPUTS),
+                                  filename="旧版票.pdf", want_pdf=True)
+        finally:
+            flow.close()
+
+        assert outcome.status == "ok", \
+            f"验证码正确时应判「一致」，实际 {outcome.status}：{outcome.summary}"
+        assert "不一致" not in (outcome.summary or ""), \
+            f"结果页固定说明里的「不符」不该把结论带成「不一致」：{outcome.summary!r}"
+        assert outcome.pdf_bytes and outcome.pdf_bytes[:5] == b"%PDF-", \
+            "结论在结果窗口里，PDF 就应该从那个窗口导出，实际没导出"
+        return (f"新窗口里的结论被读到：{outcome.status} / {outcome.summary}；"
+                f"PDF 从结果窗口导出（{len(outcome.pdf_bytes) // 1024} KB）")
+
+    ok &= check("旧版成功：结论在弹出窗口里", full_legacy_success)
 
     try:
         target.unlink()
