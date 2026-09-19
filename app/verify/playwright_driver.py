@@ -428,17 +428,24 @@ class PlaywrightVerifier(BaseVerifier):
         attempts = 0
         last_hash = ""
         source = ""
+        only_captcha = False          # True = 本轮只换验证码，不重填表单
 
         while auto_left > 0 or manual_left > 0:
             attempts += 1
 
-            # 每轮重填表单：验证码错一次之后平台通常会清空/刷新
-            t_fill = time.monotonic()
-            fill = self._fill_form(page, inputs)
-            if not fill["ok"]:
-                shot = self._grab_screenshot(page)
-                self._save_html(task_id, page)
-                return VerifyOutcome(status="error", summary=fill["reason"],
+            # 每轮重填表单：验证码错一次之后平台通常会清空/刷新。
+            # 例外：用户点的只是「跳过 / 换一张」，那就只换验证码——
+            # 重填一趟要 5~7 秒，弹窗消失后干等这么久，看起来就像点了没反应。
+            if only_captcha:
+                only_captcha = False
+                t_fill = time.monotonic()
+            else:
+                t_fill = time.monotonic()
+                fill = self._fill_form(page, inputs)
+                if not fill["ok"]:
+                    shot = self._grab_screenshot(page)
+                    self._save_html(task_id, page)
+                    return VerifyOutcome(status="error", summary=fill["reason"],
                                      screenshot=shot, captcha_attempts=attempts)
 
             img = self._locator(page, "captcha_image", wait_ms=5000)
@@ -513,8 +520,12 @@ class PlaywrightVerifier(BaseVerifier):
                     color=color, color_text=hint_text)
                 if text is None:
                     if manual_left > 0:
-                        log.info("人工未输入，刷新验证码后重试（还剩 %d 次）", manual_left)
+                        # 用户点的是「跳过 / 换一张」——只想换张验证码，
+                        # **不该把整张表单重填一遍**：重填要 5~7 秒，
+                        # 弹窗消失后干等这么久，看起来就像「点了没反应」。
+                        log.info("换一张验证码（还剩 %d 次）", manual_left)
                         self._refresh_captcha(page)
+                        only_captcha = True
                         continue
                     shot = self._grab_screenshot(page)
                     return VerifyOutcome(
@@ -1347,22 +1358,41 @@ class PlaywrightVerifier(BaseVerifier):
     # ==================================================================
     #  PDF 与调试
     # ==================================================================
+    # 打印结果页时只保留「票面」那一块。平台的结果页是一整张网页，
+    # 直接整页打印会把页头页脚、深蓝色标题条和「打印/关闭」按钮一起印进去，
+    # 看起来就是张网页截图，而不是一张发票。
+    _PRINT_CSS = """
+      body * { visibility: hidden !important; }
+      #print_area, #print_area * { visibility: visible !important; }
+      #print_area { position: absolute !important; left: 0 !important;
+                    top: 0 !important; width: 100% !important; margin: 0 !important; }
+      #print_area button { display: none !important; }
+    """
+
     def _capture_pdf(self, page) -> bytes | None:
-        """把当前结果页导成 PDF。
+        """把查验结果导成 PDF。
 
         用 CDP 而不是 page.pdf()：后者在**有头模式**下会直接报错，
         而用户完全可能把 headless 关掉。CDP 两种模式行为一致。
+
+        导出前先把页面「裁剪」成只有 ``#print_area``（票面）可见——
+        平台的结果页本身是网页，整页打印出来就是网页截图的效果。
         """
+        style_handle = None
         try:
+            if page.locator("#print_area").count() > 0:
+                style_handle = page.add_style_tag(content=self._PRINT_CSS)
+                page.wait_for_timeout(400)
+
             cdp = self._context.new_cdp_session(page)
             result = cdp.send("Page.printToPDF", {
                 "printBackground": True,
                 "paperWidth": 8.27,       # A4
                 "paperHeight": 11.69,
-                "marginTop": 0.4,
-                "marginBottom": 0.4,
-                "marginLeft": 0.4,
-                "marginRight": 0.4,
+                "marginTop": 0.3,
+                "marginBottom": 0.3,
+                "marginLeft": 0.3,
+                "marginRight": 0.3,
                 "preferCSSPageSize": False,
             })
             data = result.get("data")
@@ -1370,6 +1400,13 @@ class PlaywrightVerifier(BaseVerifier):
         except Exception as exc:
             log.warning("导出查验结果 PDF 失败：%s", exc)
             return None
+        finally:
+            # 一定要把注入的样式撤掉：同一页可能还要再查一次
+            if style_handle is not None:
+                try:
+                    style_handle.evaluate("el => el.remove()")
+                except Exception:
+                    pass
 
     @staticmethod
     def _page_state(page) -> str:
