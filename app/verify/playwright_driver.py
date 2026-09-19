@@ -333,6 +333,7 @@ class PlaywrightVerifier(BaseVerifier):
             attempts += 1
 
             # 每轮重填表单：验证码错一次之后平台通常会清空/刷新
+            t_fill = time.monotonic()
             fill = self._fill_form(page, inputs)
             if not fill["ok"]:
                 shot = self._grab_screenshot(page)
@@ -348,12 +349,12 @@ class PlaywrightVerifier(BaseVerifier):
                                      summary="找不到验证码图片元素（选择器可能已失效）",
                                      screenshot=shot, captcha_attempts=attempts)
 
-            try:
-                png = img.screenshot()
-            except Exception as exc:
+            png = self._captcha_png(img)
+            if not png:
                 return VerifyOutcome(status="error",
-                                     summary=f"验证码截图失败：{exc}",
+                                     summary="验证码图片取不到（选择器可能已失效）",
                                      captcha_attempts=attempts)
+            cap_seconds = time.monotonic() - t_fill
 
             png_hash = hashlib.sha256(png).hexdigest()
 
@@ -381,7 +382,8 @@ class PlaywrightVerifier(BaseVerifier):
                 # 弹窗必须把「只填蓝色/红色」告诉用户，否则只能瞎猜。
                 color, hint_text = self._read_captcha_hint(page)
                 if color:
-                    log.info("本次验证码要求填%s色文字", captcha_ocr.color_label(color))
+                    log.info("本次验证码要求填【%s】文字",
+                             captcha_ocr.color_label(color))
                 else:
                     log.info("未能从页面读出验证码颜色提示（原文：%r）", hint_text)
                 log.info("转人工输入验证码（%s）", filename or task_id)
@@ -420,16 +422,52 @@ class PlaywrightVerifier(BaseVerifier):
             #
             # 用 expect_response 包住点击，而不是在事件回调里存 response 再回来读——
             # 后者在同步 API 里等到读的时候 body 已经失效（实测拿不到数据）。
+            #
+            # 同时记录提交期间的关键请求和主页面跳转：一旦「提交了却没结论」，
+            # 这两样是唯一能说清原因的线索（接口到底发没发、页面是不是被整页刷掉了）。
             api: dict | None = None
+            seen: list[str] = []
+            navs: list[str] = []
+
+            def _on_request(req):
+                try:
+                    if req.resource_type in ("xhr", "fetch", "document"):
+                        seen.append(f"{req.method} {req.url.split('?')[0][-70:]}")
+                except Exception:
+                    pass
+
+            def _on_navigated(frame):
+                try:
+                    if frame == page.main_frame:
+                        navs.append(frame.url.split("?")[0][-70:])
+                except Exception:
+                    pass
+
+            page.on("request", _on_request)
+            page.on("framenavigated", _on_navigated)
+            t_submit = time.monotonic()
             try:
                 with page.expect_response(
-                        lambda r: _QUERY_API_MARK in r.url, timeout=25000) as info:
-                    self._click_submit(page)
+                        lambda r: _QUERY_API_MARK in r.url, timeout=12000) as info:
+                    if not self._click_submit(page):
+                        log.warning(
+                            "没能点中「查验」按钮（可见且可点的那个没找到）"
+                            "。页面状态：%s", self._page_state(page))
                 api = info.value.json()
             except Exception as exc:
                 log.debug("没有捕获到查验接口返回（改用页面文本判定）：%s", exc)
 
             status, summary, body = self._wait_result(page, baseline, api)
+
+            try:
+                page.remove_listener("request", _on_request)
+                page.remove_listener("framenavigated", _on_navigated)
+            except Exception:
+                pass
+
+            log.info("第 %d 轮：填表+取验证码 %.1fs，提交+等结论 %.1fs，查验接口%s",
+                     attempts, cap_seconds, time.monotonic() - t_submit,
+                     "已返回" if api is not None else "没返回")
 
             if status == "captcha_wrong":
                 log.info("第 %d 次验证码被平台拒绝", attempts)
@@ -442,13 +480,25 @@ class PlaywrightVerifier(BaseVerifier):
             if status == "unknown":
                 shot = self._grab_screenshot(page)
                 self._save_html(task_id, page)
+                # 这是最难查的一类失败：页面看着「提交过了」，却什么都没有。
+                # 把提交期间看到的东西一次性打全，下次看日志就能定位：
+                #   * 主页面跳转过 → 点击触发了整页提交，表单被刷空了；
+                #   * 一个 xhr 都没有 → 点击压根没触发站点的 ajax 处理；
+                #   * 有 xhr 但没结论 → 是结论识别的关键词/选择器要更新。
+                log.warning(
+                    "没能识别出结论：提交后主页面跳转 %d 次%s；关键请求 %d 个%s",
+                    len(navs),
+                    f"（最后一次：{navs[-1]}）" if navs else "",
+                    len(seen),
+                    "（" + "；".join(seen[-6:]) + "）" if seen else "")
                 return VerifyOutcome(
                     status="unknown",
                     summary="页面已提交，但没能识别出结论（可重试）",
                     detail=self._trim(body), raw_text=body,
                     captcha_source=source, captcha_attempts=attempts,
                     screenshot=shot, page_url=getattr(page, "url", ""),
-                    extra={"api": api},
+                    extra={"api": api, "navigations": navs[-3:],
+                           "requests": seen[-12:]},
                 )
 
             # 有结论了：等结果区渲染完，再导 PDF
@@ -918,6 +968,41 @@ class PlaywrightVerifier(BaseVerifier):
             if wait_ms <= 0 or time.monotonic() >= deadline:
                 return None
             page.wait_for_timeout(300)
+
+    @staticmethod
+    def _captcha_png(img) -> bytes | None:
+        """取验证码图片的原始字节。
+
+        旧版的验证码是 ``data:image/png;base64,...`` 内联图，**直接解码 src**
+        比 ``locator.screenshot()`` 好三点：
+
+        * **快得多**——``screenshot()`` 会等元素「稳定」（连续两帧位置不变）
+          才肯截，而这张图所在的容器带 hover 动画，实测能白等几十秒；
+        * 拿到的是**原始像素**，不会把 CSS 缩放、叠加层一起截进来；
+        * 不受窗口大小 / 滚动位置 / 元素被遮挡的影响。
+
+        拿不到 data URL 时（新版 SPA 或别的形态）再退回截图。
+        """
+        try:
+            src = img.get_attribute("src") or ""
+        except Exception as exc:
+            log.debug("读取验证码 src 失败：%s", exc)
+            src = ""
+
+        marker = "base64,"
+        if src.startswith("data:image") and marker in src:
+            try:
+                data = base64.b64decode(src.split(marker, 1)[1])
+                if data:
+                    return data
+            except Exception as exc:
+                log.debug("验证码 data URL 解码失败：%s", exc)
+
+        try:
+            return img.screenshot(timeout=8000)
+        except Exception as exc:
+            log.debug("验证码截图失败：%s", exc)
+            return None
 
     def _read_alert_message(self, page) -> str:
         """读平台自绘提示框里的文字。
