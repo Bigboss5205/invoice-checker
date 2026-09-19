@@ -1112,6 +1112,47 @@ def check_captcha_ocr() -> bool:
 
     ok &= check("真实验证码底色不误判", real_captcha_background)
 
+    def ai_captcha():
+        """视觉大模型那一路：配置判定与回复清洗（不联网）。"""
+        from app.captcha import ai as captcha_ai
+        from app.config import load_config
+
+        cfg = load_config()
+        for k in ("base_url", "model", "api_key"):
+            cfg.data["captcha"]["ai"][k] = ""
+        import os
+        os.environ.pop(captcha_ai.ENV_API_KEY, None)
+
+        assert not captcha_ai.enabled(cfg), "三项都没填时不该启用 AI"
+        assert not captcha_ai.solve(b"\x89PNG", "", cfg), "没配置就该直接返回 None"
+
+        cfg.data["captcha"]["ai"]["base_url"] = "https://example.invalid/v1"
+        cfg.data["captcha"]["ai"]["model"] = "some-vl-model"
+        assert not captcha_ai.enabled(cfg), "缺 api_key 时不该启用"
+        cfg.data["captcha"]["ai"]["api_key"] = "sk-test"
+        assert captcha_ai.enabled(cfg), "三项填齐应启用"
+
+        # 回复清洗：模型爱加解释和标点，标点/空白要清掉。
+        # 注意这里**不**剥「答案是」这类中文说明词——验证码本身可能就是中文
+        # （实测出现过「村朋FQ」），按词表剥会把真实的字吃掉。
+        c = captcha_ai._clean
+        assert c("村朋FQ") == "村朋FQ", "中文混排的验证码要原样保留"
+        assert c("  村朋FQ\n") == "村朋FQ"
+        assert c("「AB12」") == "AB12", "引号要丢掉"
+        assert c("AB-12") == "AB12", "标点/空格要丢掉"
+        assert c("AB 12。") == "AB12"
+        assert c("AB12\n（蓝色文字）") == "AB12", "只取第一行"
+        assert c("") is None and c("   ") is None and c("。。") is None
+        assert c("这段解释很长很长很长很长很长很长很长") is None, "过长应丢弃"
+
+        # 提示词要把平台的原文颜色要求带进去
+        p = captcha_ai._prompt("请输入验证码图片中蓝色文字", True)
+        assert "蓝色" in p and "第二张图" in p, f"提示词没带上颜色要求：{p!r}"
+        assert "只输出" in p, "必须明确要求只输出字符本身"
+        return f"配置判定正确；回复清洗正确（{captcha_ai.describe(cfg)}）"
+
+    ok &= check("AI 验证码（视觉模型）", ai_captcha)
+
     if not ocr.available():
         record("SKIP", "ddddocr 初始化",
                "不可用 —— 验证码将全部转人工输入，功能不受影响")
