@@ -152,10 +152,15 @@ class PlaywrightVerifier(BaseVerifier):
         self._context.set_default_timeout(10000)
         self._context.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-        self._context.on("page", self._on_new_page)
         self._page = self._context.new_page()
         self._page.on("response", self._on_response)
         self._install_page_logging(self._page)
+        # 必须在主页面创建**之后**再挂 page 监听：context.on("page") 对
+        # 主页面本身也会触发，而那一刻 self._page 还没赋值，
+        # 身份判等 `page is self._page` 恒为假 —— 结果是把主页面自己
+        # 当成「平台弹出的结果窗口」记了一笔（日志里那句
+        # 「平台打开了新窗口：about:blank」就是这么来的）。
+        self._context.on("page", self._on_new_page)
         log.info("浏览器就绪（%s，headless=%s）", self._channel_used, self.headless)
 
     def _on_new_page(self, page) -> None:
@@ -547,7 +552,9 @@ class PlaywrightVerifier(BaseVerifier):
             def _on_request(req):
                 try:
                     if req.resource_type in ("xhr", "fetch", "document"):
-                        seen.append(f"{req.method} {req.url.split('?')[0][-70:]}")
+                        # **保留查询串**：平台的结论很可能就挂在 URL 参数上，
+                        # 早先把它截掉了，等于把最关键的线索扔了。
+                        seen.append(f"{req.method} {req.url}"[:220])
                 except Exception:
                     pass
 
@@ -612,6 +619,15 @@ class PlaywrightVerifier(BaseVerifier):
                     "（" + "；".join(seen[-6:]) + "）" if seen else "")
                 if left_dialogs:
                     log.warning("提交期间浏览器弹窗：%s", "；".join(left_dialogs[-3:]))
+                # 把所有「可能是结果页」的窗口状态打出来：URL、是否还开着、
+                # 正文开头。这一步是判断「结果窗口到底有没有内容」的唯一依据。
+                for p in self._result_pages(page):
+                    try:
+                        log.warning("  候选结果页：url=%s closed=%s %s",
+                                    (p.url or "")[:160], p.is_closed(),
+                                    self._trim(self._body_text(p) or "(正文为空)", 160))
+                    except Exception as exc:
+                        log.warning("  候选结果页读取失败：%s", exc)
                 return VerifyOutcome(
                     status="unknown",
                     summary="页面已提交，但没能识别出结论（可重试）",
@@ -1040,14 +1056,22 @@ class PlaywrightVerifier(BaseVerifier):
                     self._result_page = page
                     return status, msg, self._body_text(page)
 
-            for cand in self._result_pages(page):
+            for cand, owner in self._result_targets(page):
+                # 0.2) 最准的一路：直接读结果页的「结果：」那一栏（#cyjg）。
+                cell = self._read_result_cell(cand)
+                if cell:
+                    status = classify(cell, self.cfg, "")
+                    if status != "unknown":
+                        self._result_page = owner
+                        return status, f"结果：{cell}", self._body_text(cand)
+
                 # 0.5) 平台自绘的提示框——「验证码错误!」这类结论都放这里，
                 #      优先读它：比扫整页文本准，也不会被帮助文字干扰
                 alert = self._read_alert_message(cand)
                 if alert:
                     status = classify(alert, self.cfg, "")
                     if status != "unknown":
-                        self._result_page = cand
+                        self._result_page = owner
                         return status, alert, self._body_text(cand)
 
                 # 2) 兜底：万一 expect_response 没接住，再看看监听器有没有存下响应
@@ -1059,7 +1083,7 @@ class PlaywrightVerifier(BaseVerifier):
                         if status == "unknown" and code == _CODE_CAPTCHA_WRONG:
                             status = "captcha_wrong"
                         if status != "unknown":
-                            self._result_page = cand
+                            self._result_page = owner
                             return status, msg, self._body_text(cand)
 
                 # 3) 再兜底：读页面文本。
@@ -1074,24 +1098,74 @@ class PlaywrightVerifier(BaseVerifier):
                         if field:
                             status = classify(field, self.cfg, "")
                             if status != "unknown":
-                                self._result_page = cand
+                                self._result_page = owner
                                 return status, f"结果：{field}", text
                         status = classify(strip_result_boilerplate(text),
                                           self.cfg, "")
                         if status != "unknown":
-                            self._result_page = cand
+                            self._result_page = owner
                             return status, self._summarize(status, text), text
                         continue
 
                     status = classify(text, self.cfg, baseline)
                     if status != "unknown":
-                        self._result_page = cand
+                        self._result_page = owner
                         return status, self._summarize(status, text), text
                     body = text
 
             page.wait_for_timeout(400)
 
         return "unknown", "", body
+
+    def _result_targets(self, page) -> list:
+        """所有可能装着结论的地方，返回 ``[(可读对象, 所属页面), …]``。
+
+        三层都要看：
+
+        1. 主页面本身；
+        2. **主页面的所有 iframe** —— 实测提交后只出现一个
+           ``GET …/jgbyz.html`` 的 document 请求，而主页面既不跳转、
+           也没有新窗口事件。那就是平台把结果**装进了 iframe**；
+           而 ``page.inner_text("body")`` 读不到 iframe 里的内容，
+           只看主页面自然什么都找不到。
+        3. 平台弹出的窗口（旧版也可能用 ``window.open``）。
+
+        返回的第二个元素是「所属页面」——iframe 自己不能导出 PDF，
+        导出要用它所属的那个 Page。
+        """
+        targets: list = []
+        for p in self._result_pages(page):
+            targets.append((p, p))
+            try:
+                for frame in p.frames:
+                    if frame is not p.main_frame:
+                        targets.append((frame, p))
+            except Exception:
+                continue
+        return targets
+
+    def _read_result_cell(self, page) -> str:
+        """直接读结果页上「结果：」那一栏的值。
+
+        实测结果页（jgbyz.html）的结构是::
+
+            <span>结果： <strong id="cyjg"></strong>
+                  <span id="cysj">查验时间：…</span></span>
+
+        直接读 ``#cyjg`` 比扫整页文本可靠得多：不受固定说明、
+        表格排版、以及「结果：」后面紧跟别的标签的影响。
+        """
+        for sel in self._candidates("result_cell"):
+            try:
+                loc = page.locator(sel).first
+                if loc.count() == 0:
+                    continue
+                text = (loc.inner_text(timeout=1500) or "").strip()
+                if text:
+                    return text
+            except Exception:
+                continue
+        return ""
 
     def _summarize(self, status: str, body: str) -> str:
         for kw in (self.cfg.get(f"platform.result_keywords.{status}", []) or []):
