@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..captcha import ai as captcha_ai
 from ..captcha import ocr as captcha_ocr
 from .base import BaseVerifier, VerifyOutcome, classify
 
@@ -118,6 +119,10 @@ class PlaywrightVerifier(BaseVerifier):
         self._popups: list = []
         self._result_page = None         # 真正显示结论的那一页（可能是弹窗）
 
+        # 站点校验不通过时弹的是**原生 alert**；Playwright 没有监听器时会
+        # 默默把它点掉，页面上什么都不留。这里把它记下来。
+        self._dialogs: list = []
+
     # ==================================================================
     #  生命周期
     # ==================================================================
@@ -139,7 +144,12 @@ class PlaywrightVerifier(BaseVerifier):
             user_agent=_CHROME_UA,
             ignore_https_errors=True,
         )
-        self._context.set_default_timeout(self.nav_timeout)
+        # 默认超时**刻意设短**：所有「等元素可点 / 可写」的动作都继承它。
+        # 早先这里挂的是 nav_timeout(45s)，于是 `_set_date_legacy` 里那句
+        # 只是「点一下让站点占位符逻辑先跑」的 click，在元素被判为不可点时
+        # 硬等了 45 秒才抛异常——日志里就表现为「填表+取验证码 52.8s」。
+        # 真正需要等很久的只有导航，而导航都是显式传 nav_timeout 的。
+        self._context.set_default_timeout(10000)
         self._context.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         self._context.on("page", self._on_new_page)
@@ -187,8 +197,29 @@ class PlaywrightVerifier(BaseVerifier):
             page.on("pageerror", self._on_page_error)
             page.on("console", self._on_console)
             page.on("requestfailed", self._on_request_failed)
+            page.on("dialog", self._on_dialog)
         except Exception as exc:
             log.debug("安装页面日志监听失败：%s", exc)
+
+    def _on_dialog(self, dialog) -> None:
+        """接住浏览器的**原生**弹窗（alert / confirm / prompt）。
+
+        这个必须自己监听：Playwright 在没有 ``dialog`` 监听器时会
+        **自动把弹窗点掉**，页面上不留任何痕迹。而旧版平台校验不通过时
+        弹的正是原生 alert ——于是表现出来的现象是
+        「点了查验，一个请求都没发出去，也没有任何提示，表单还被清空了」，
+        完全无从下手。把文字记下来（并主动关掉，不关会把页面卡住）。
+        """
+        try:
+            text = f"[{dialog.type}] {dialog.message}"
+            self._dialogs.append(text)
+            log.info("浏览器弹窗：%s", text)
+        except Exception:
+            pass
+        try:
+            dialog.dismiss()
+        except Exception:
+            pass
 
     @staticmethod
     def _on_page_error(error) -> None:
@@ -374,6 +405,11 @@ class PlaywrightVerifier(BaseVerifier):
             )
 
         auto_left = self.max_auto if (self.auto_ocr and captcha_ocr.available()) else 0
+        # 配了视觉大模型就一定有「自动」这条路：它比 ddddocr 靠谱得多，
+        # 也是唯一能让你不用逐张手敲的办法。
+        if captcha_ai.enabled(self.cfg):
+            auto_left = max(auto_left, self.max_auto)
+            log.info("验证码 AI 识别已启用：%s", captcha_ai.describe(self.cfg))
         manual_left = self.max_manual if self.prompter is not None else 0
         # 记下初始额度，最后好如实报告实际用掉几次
         auto_budget, manual_budget = auto_left, manual_left
@@ -422,10 +458,30 @@ class PlaywrightVerifier(BaseVerifier):
                 source = "ocr"
                 # 每次现读提示要哪个颜色：平台会在蓝/红之间切换，
                 # 写死一种颜色会把另一类验证码全认错。
-                color = self._read_captcha_color(page)
+                color, hint_text = self._read_captcha_hint(page)
                 if color:
-                    log.debug("验证码要求填%s色文字", color)
-                text = captcha_ocr.solve(png, color)
+                    log.debug("验证码要求填【%s】文字",
+                              captcha_ocr.color_label(color))
+
+                # 1) 先试视觉大模型——它跟人一样「看图 + 按提示挑颜色」，
+                #    对中英混排的彩色验证码远好于 ddddocr。
+                text = None
+                if captcha_ai.enabled(self.cfg):
+                    filtered = None
+                    if color:
+                        try:
+                            filtered = captcha_ocr.color_filter(png, color)
+                        except Exception:
+                            filtered = None
+                    text = captcha_ai.solve(png, hint_text, self.cfg,
+                                            filtered_png=filtered)
+                    if text:
+                        source = "ai"
+
+                # 2) 再退化到 ddddocr（颜色分离 + 识别）
+                if not text:
+                    text = captcha_ocr.solve(png, color)
+
                 if not text:
                     log.debug("第 %d 次自动识别失败", attempts)
                     if png_hash == last_hash:
@@ -504,6 +560,7 @@ class PlaywrightVerifier(BaseVerifier):
 
             page.on("request", _on_request)
             page.on("framenavigated", _on_navigated)
+            self._dialogs.clear()
             t_submit = time.monotonic()
             try:
                 with page.expect_response(
@@ -517,6 +574,9 @@ class PlaywrightVerifier(BaseVerifier):
                 log.debug("没有捕获到查验接口返回（改用页面文本判定）：%s", exc)
 
             status, summary, body = self._wait_result(page, baseline, api)
+            # _wait_result 会把「能判定成结论」的弹窗消费掉；
+            # 剩下的就是没认出来的，全是排查线索。
+            left_dialogs = list(self._dialogs)
 
             try:
                 page.remove_listener("request", _on_request)
@@ -550,6 +610,8 @@ class PlaywrightVerifier(BaseVerifier):
                     f"（最后一次：{navs[-1]}）" if navs else "",
                     len(seen),
                     "（" + "；".join(seen[-6:]) + "）" if seen else "")
+                if left_dialogs:
+                    log.warning("提交期间浏览器弹窗：%s", "；".join(left_dialogs[-3:]))
                 return VerifyOutcome(
                     status="unknown",
                     summary="页面已提交，但没能识别出结论（可重试）",
@@ -557,7 +619,7 @@ class PlaywrightVerifier(BaseVerifier):
                     captcha_source=source, captcha_attempts=attempts,
                     screenshot=shot, page_url=getattr(page, "url", ""),
                     extra={"api": api, "navigations": navs[-3:],
-                           "requests": seen[-12:]},
+                           "requests": seen[-12:], "dialogs": left_dialogs[-5:]},
                 )
 
             # 有结论了。结论可能在**另一个窗口**里（旧版 → jgbyz.html），
@@ -780,7 +842,11 @@ class PlaywrightVerifier(BaseVerifier):
         能生效——直接 type/fill 都会被站点自己的处理逻辑抹回 YYYYMMDD。
         """
         try:
-            loc.click()          # 点一下，让站点的占位符逻辑先跑
+            # 这一步只是「先点一下，让站点的占位符逻辑跑起来」，
+            # 真正的写值靠下面的原生 setter。所以绝不能在这里久等：
+            # 元素一旦被判为不可点（被日历面板压着等），
+            # 用默认超时会白等几十秒，而跳过它对结果毫无影响。
+            loc.click(timeout=2500)
         except Exception:
             pass
         page.wait_for_timeout(300)
@@ -965,9 +1031,18 @@ class PlaywrightVerifier(BaseVerifier):
         body = ""
 
         while time.monotonic() < deadline:
+            # 0) 原生 alert：站点校验不通过时最先出现的就是它。
+            #    它比接口和页面文本都早，而且只有这里能看到。
+            while self._dialogs:
+                msg = self._dialogs.pop(0)
+                status = classify(msg, self.cfg, "")
+                if status != "unknown":
+                    self._result_page = page
+                    return status, msg, self._body_text(page)
+
             for cand in self._result_pages(page):
-                # 0) 平台自绘的提示框——「验证码错误!」这类结论都放这里，
-                #    优先读它：比扫整页文本准，也不会被帮助文字干扰
+                # 0.5) 平台自绘的提示框——「验证码错误!」这类结论都放这里，
+                #      优先读它：比扫整页文本准，也不会被帮助文字干扰
                 alert = self._read_alert_message(cand)
                 if alert:
                     status = classify(alert, self.cfg, "")
