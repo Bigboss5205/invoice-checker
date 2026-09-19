@@ -46,6 +46,26 @@ captcha:
   manual_timeout_seconds: 180
   manual_max_rounds: 3      # 人工最多被问几次（点「跳过」会换一张再问）
 
+  # 视觉大模型识别验证码（可选，但强烈建议）。
+  #
+  # 平台这个验证码是「挑出指定颜色的字符」且中英混排，ddddocr 基本认不出；
+  # 视觉模型跟人一样看图 + 按提示挑颜色，成功率天差地别，而且不用你逐张手敲。
+  # 下面三项填齐就自动生效（auto_ocr 开不开都行），留空则完全不启用。
+  #
+  #   接口要求：兼容 OpenAI 的 POST {base_url}/chat/completions，
+  #            消息 content 里带 image_url（也就是"能看图"）。
+  #   例：https://api.openai.com/v1                        + gpt-4o-mini
+  #       https://dashscope.aliyuncs.com/compatible-mode/v1 + qwen-vl-max
+  #       https://open.bigmodel.cn/api/paas/v4              + glm-4v-flash
+  #   注意：**模型必须支持图片输入**，纯文本模型（如 deepseek-chat）不行。
+  #
+  # 发出去的只有验证码图片本身，不含任何发票信息。
+  ai:
+    base_url: ""
+    model: ""
+    api_key: ""             # 也可以不写在这，改用环境变量 INV_CAPTCHA_AI_KEY
+    timeout_seconds: 20
+
 verify:
   enabled: true
   driver: playwright        # playwright=真实查验；fake=离线演练（结果全是模拟的）
