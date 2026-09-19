@@ -1358,6 +1358,14 @@ def mock_legacy_page() -> str:
   kprq.addEventListener('input', function () {
     if (!/^\\d{8}$/.test(kprq.value)) { kprq.value = 'YYYYMMDD'; }
   });
+  // 坑6（最阴的一个）：日历控件在**失焦**时把它内部的日期写回输入框，
+  //      而它内部默认停在「今天」。实测就是这样把票面的 14 日改成 19 日，
+  //      平台据此判「不一致」——填表阶段读回是对的，只有提交前再查才抓得到。
+  //      这里用 $drift 开关模拟，供回归用例单独打开。
+  var $driftLeft = (location.search.indexOf('drift=1') >= 0) ? 1 : 0;
+  kprq.addEventListener('blur', function () {
+    if ($driftLeft > 0) { $driftLeft--; kprq.value = '20260919'; }
+  });
   // 坑3：结论放在自绘弹窗里
   // 坑5（最关键）：验证码**正确**时，平台把结果开在**新窗口**里，
   //      主页面不跳转、也没有任何结论文字——只盯主页面的实现会误判成「结果未知」。
@@ -1476,6 +1484,37 @@ def check_legacy_mode() -> bool:
         return f"日期写入成功且没被站点 JS 抹掉：{got}"
 
     ok &= check("旧版日期填充（原生 setter）", date_js_setter)
+
+    def date_drift_guard():
+        """回归：日历控件在失焦时把日期改成「今天」，提交前必须拦住。
+
+        实测事故：票面开票日期 14 日，程序填对了（填表阶段回读也对），
+        但日历控件失焦时把自己内部的日期（今天，19 日）写回了输入框，
+        平台据此判「不一致」。修复办法是提交前再核一次并重写。
+        """
+        page = state["page"]
+        page.goto(cfg.start_url + "?drift=1", wait_until="load", timeout=30000)
+        page.wait_for_timeout(400)
+        assert verifier._set_date(page, "2024-03-15"), "日期设置失败"
+        # 先制造漂移：模拟「点查验时输入框失焦 → 控件把今天写回来」。
+        # 漂移是一次性的，而 _set_date 自己可能已经把它用掉并自愈了，
+        # 所以这里重新武装一次。
+        page.evaluate("() => { window.$driftLeft = 1; "
+                      "document.getElementById('kprq').dispatchEvent("
+                      "new Event('blur', {bubbles: true})); }")
+        page.wait_for_timeout(200)
+        drifted = verifier._input_value(page.locator("#kprq"))
+        assert drifted == "20260919", f"用例本身应能造出漂移，实际 {drifted!r}"
+
+        inputs = dict(_LEGACY_INPUTS)
+        assert verifier._enforce_date(page, inputs), "提交前应把日期改回来"
+        fixed = verifier._input_value(page.locator("#kprq"))
+        assert fixed == "20240315", f"日期应改回 20240315，实际 {fixed!r}"
+        page.goto(cfg.start_url, wait_until="load", timeout=30000)
+        page.wait_for_timeout(300)
+        return f"漂移 {drifted} 被拦下并改回 {fixed}"
+
+    ok &= check("提交前日期漂移兜底", date_drift_guard)
 
     def label_switch():
         """坑1：形态异步切换，必须等切换完再取值。"""
