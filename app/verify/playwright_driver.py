@@ -67,10 +67,17 @@ _RE_RESULT_FIELD = re.compile(r"结果\s*[:：]\s*([^\s|｜]{1,16})")
 
 # 结果页底部这句是**固定说明，每张票都在**，而且里面带「不符」。
 # 直接拿整页文本去匹配关键词，会把每一张票都判成「不一致」——
-# 对发票工具来说这是最危险的误判，所以分类前先把它剔掉。
-_RESULT_BOILERPLATE = (
-    "发票信息不符时不得作为财务报销凭证",
-    "任何单位和个人有权拒收并举报",
+# 对发票工具来说这是最危险的误判（把真票说成假票），所以必须先剔掉。
+#
+# 用**短语片段**匹配而不是整句：平台的措辞变过（实测出现过
+# 「发票信息不符时不得作为财务报销凭证，任何单位和个人有权拒收并举报！」
+# 和「若发现发票查验结果与实际交易不符，任何单位或个人有权拒收并向当地税务机关举报。」
+# 两种），写死整句就会漏。
+_RESULT_BOILERPLATE_MARKS = (
+    "不得作为财务报销凭证",
+    "有权拒收",
+    "与实际交易不符",
+    "向当地税务机关举报",
 )
 
 
@@ -81,10 +88,19 @@ def result_field(text: str) -> str:
 
 
 def strip_result_boilerplate(text: str) -> str:
-    """去掉结果页上的固定说明，避免「不符」把结论带偏。"""
-    for line in _RESULT_BOILERPLATE:
-        text = text.replace(line, "")
-    return text
+    """去掉结果页上的固定说明，避免「不符」把结论带偏。
+
+    按**行**剔：含任一标记短语的行整行删掉。真正的结论（一致/不一致/
+    查无此票/超次数）都不会出现在这些句子里，所以删掉是安全的。
+    """
+    if not text:
+        return text
+    kept = []
+    for line in text.splitlines():
+        if any(mark in line for mark in _RESULT_BOILERPLATE_MARKS):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 class PlaywrightVerifier(BaseVerifier):
@@ -1069,7 +1085,7 @@ class PlaywrightVerifier(BaseVerifier):
 
             for cand, owner in self._result_targets(page):
                 # 0.2) 最准的一路：直接读结果页的「结果：」那一栏（#cyjg）。
-                cell = self._read_result_cell(cand)
+                has_cell, cell = self._read_result_cell(cand)
                 if cell:
                     status = classify(cell, self.cfg, "")
                     if status != "unknown":
@@ -1103,25 +1119,32 @@ class PlaywrightVerifier(BaseVerifier):
                 text = self._body_text(cand)
                 if text:
                     if cand is not page:
-                        # 结果窗口：优先只用「结果：xxx」那个字段；
-                        # 拿不到才退回整页文本，且先剔掉那句带「不符」的固定说明。
+                        if has_cell:
+                            # 这就是结果页，只是「结果：」还没填上 → 继续等。
+                            # **绝不能**退回扫文本：那页底部有
+                            # 「…与实际交易不符…」这类固定说明，
+                            # 扫文本会把每一张票都判成「不一致」。
+                            continue
+                        # 没有 #cyjg（不是标准结果页）：退回整页文本，
+                        # 但先按行剔掉带「不符」的固定说明。
                         field = result_field(text)
                         if field:
                             status = classify(field, self.cfg, "")
                             if status != "unknown":
                                 self._result_page = owner
                                 return status, f"结果：{field}", text
-                        status = classify(strip_result_boilerplate(text),
-                                          self.cfg, "")
+                        clean = strip_result_boilerplate(text)
+                        status = classify(clean, self.cfg, "")
                         if status != "unknown":
                             self._result_page = owner
-                            return status, self._summarize(status, text), text
+                            return status, self._summarize(status, clean), text
                         continue
 
-                    status = classify(text, self.cfg, baseline)
+                    clean = strip_result_boilerplate(text)
+                    status = classify(clean, self.cfg, baseline)
                     if status != "unknown":
                         self._result_page = owner
-                        return status, self._summarize(status, text), text
+                        return status, self._summarize(status, clean), text
                     body = text
 
             page.wait_for_timeout(400)
@@ -1155,8 +1178,8 @@ class PlaywrightVerifier(BaseVerifier):
                 continue
         return targets
 
-    def _read_result_cell(self, page) -> str:
-        """直接读结果页上「结果：」那一栏的值。
+    def _read_result_cell(self, page) -> tuple[bool, str]:
+        """直接读结果页上「结果：」那一栏的值，返回 ``(有没有这个元素, 文字)``。
 
         实测结果页（jgbyz.html）的结构是::
 
@@ -1171,12 +1194,13 @@ class PlaywrightVerifier(BaseVerifier):
                 loc = page.locator(sel).first
                 if loc.count() == 0:
                     continue
-                text = (loc.inner_text(timeout=1500) or "").strip()
-                if text:
-                    return text
+                # 「元素在、但文字还空着」是很常见的中间状态：
+                # 结果页先渲染出来，再由 JS 把结论填进去。
+                # 所以要能区分「没有这个元素」和「有但还没填」。
+                return True, (loc.inner_text(timeout=1500) or "").strip()
             except Exception:
                 continue
-        return ""
+        return False, ""
 
     def _summarize(self, status: str, body: str) -> str:
         for kw in (self.cfg.get(f"platform.result_keywords.{status}", []) or []):
