@@ -154,6 +154,9 @@ DEFAULTS: dict[str, Any] = {
             "captcha_refresh": ["text=点击图片刷新", "#yzm_img"],
             "captcha_hint": ["#yzminfo", "#yzm"],
             "submit": ["#checkfp", "#uncheckfp"],
+            # 结果窗口（jgbyz.html）里「结果：」那一栏的值就装在这个元素里。
+            # 直接读它比扫整页文本可靠：那页底部带固定说明、排版还是表格。
+            "result_cell": ["#cyjg", "strong#cyjg"],
             # 旧版把提示/错误都塞进这个自绘弹窗里：
             #   <div id="popup_message">验证码错误!</div>
             #   <input type="button" value="&nbsp;确定&nbsp;" id="popup_ok">
