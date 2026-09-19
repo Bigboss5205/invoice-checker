@@ -61,6 +61,30 @@ _CODE_CAPTCHA_WRONG = "97"
 # SPA 渲染失败时，整页重新导航的重试次数
 _RENDER_RETRIES = 3
 
+# 结果页（jgbyz.html）里「结果：一致」那个字段
+_RE_RESULT_FIELD = re.compile(r"结果\s*[:：]\s*([^\s|｜]{1,16})")
+
+# 结果页底部这句是**固定说明，每张票都在**，而且里面带「不符」。
+# 直接拿整页文本去匹配关键词，会把每一张票都判成「不一致」——
+# 对发票工具来说这是最危险的误判，所以分类前先把它剔掉。
+_RESULT_BOILERPLATE = (
+    "发票信息不符时不得作为财务报销凭证",
+    "任何单位和个人有权拒收并举报",
+)
+
+
+def result_field(text: str) -> str:
+    """从结果页文本里精确取出「结果：xxx」的值（取不到返回空串）。"""
+    m = _RE_RESULT_FIELD.search(text or "")
+    return m.group(1) if m else ""
+
+
+def strip_result_boilerplate(text: str) -> str:
+    """去掉结果页上的固定说明，避免「不符」把结论带偏。"""
+    for line in _RESULT_BOILERPLATE:
+        text = text.replace(line, "")
+    return text
+
 
 class PlaywrightVerifier(BaseVerifier):
     name = "playwright"
@@ -89,6 +113,11 @@ class PlaywrightVerifier(BaseVerifier):
         self._query_response = None      # 最近一次 queryFpcyxx 的响应对象
         self._query_seen = 0             # 已消费到第几次
 
+        # 旧版平台把**查验结果开在新窗口里**（jgbyz.html），主页面不跳转。
+        # 不盯着这些窗口就只能看到「页面已提交，但没有结论」——实测踩过这个坑。
+        self._popups: list = []
+        self._result_page = None         # 真正显示结论的那一页（可能是弹窗）
+
     # ==================================================================
     #  生命周期
     # ==================================================================
@@ -113,10 +142,40 @@ class PlaywrightVerifier(BaseVerifier):
         self._context.set_default_timeout(self.nav_timeout)
         self._context.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+        self._context.on("page", self._on_new_page)
         self._page = self._context.new_page()
         self._page.on("response", self._on_response)
         self._install_page_logging(self._page)
         log.info("浏览器就绪（%s，headless=%s）", self._channel_used, self.headless)
+
+    def _on_new_page(self, page) -> None:
+        """记下平台新开的窗口。
+
+        旧版查验成功后是用 ``window.open('jgbyz.html')`` 把结果**开在新窗口**里的：
+        主页面既不跳转、接口也不返回 JSON，结论只存在于那个新窗口里。
+        只盯主页面的话，一次成功的查验会被误判成「没能识别出结论」。
+        """
+        try:
+            if page is self._page:
+                return
+            self._popups.append(page)
+            page.on("response", self._on_response)
+            self._install_page_logging(page)
+            log.info("平台打开了新窗口（查验结果通常在这里）：%s",
+                     (page.url or "")[:120] or "(正在加载)")
+        except Exception as exc:
+            log.debug("登记新窗口失败：%s", exc)
+
+    def _result_pages(self, page) -> list:
+        """可能要读结论的所有页面：主页面 + 平台弹出的结果窗口。"""
+        pages = [page]
+        for p in list(self._popups):
+            try:
+                if p is not page and not p.is_closed():
+                    pages.append(p)
+            except Exception:
+                continue
+        return pages
 
     def _install_page_logging(self, page) -> None:
         """把页面里的 JS 异常、控制台报错、加载失败的资源记进日志。
@@ -501,10 +560,16 @@ class PlaywrightVerifier(BaseVerifier):
                            "requests": seen[-12:]},
                 )
 
-            # 有结论了：等结果区渲染完，再导 PDF
-            page.wait_for_timeout(2500)
-            body = self._body_text(page) or body
-            pdf = self._capture_pdf(page) if want_pdf else None
+            # 有结论了。结论可能在**另一个窗口**里（旧版 → jgbyz.html），
+            # 所以后面一律用 _result_page：文本读它、PDF 也从它导出——
+            # 那才是用户要的「已查验」那一页。
+            result_page = self._result_page or page
+            if result_page is not page:
+                log.info("查验结论来自平台弹出的结果窗口：%s",
+                         (getattr(result_page, "url", "") or "")[:120])
+            result_page.wait_for_timeout(1000)      # 等结果区渲染稳
+            body = self._body_text(result_page) or body
+            pdf = self._capture_pdf(result_page) if want_pdf else None
             if want_pdf and pdf is None:
                 log.warning("查验有结论，但结果 PDF 导出失败")
 
@@ -513,7 +578,7 @@ class PlaywrightVerifier(BaseVerifier):
                 summary=summary or self._summarize(status, body),
                 detail=self._trim(body), raw_text=body,
                 captcha_source=source, captcha_attempts=attempts,
-                pdf_bytes=pdf, page_url=getattr(page, "url", ""),
+                pdf_bytes=pdf, page_url=getattr(result_page, "url", ""),
                 extra={"api": api},
             )
 
@@ -880,7 +945,13 @@ class PlaywrightVerifier(BaseVerifier):
         """等结论。返回 (状态, 摘要, 页面文本)。
 
         优先用 queryFpcyxx 接口的 JSON（更早更准），页面文本兜底。
+
+        **关键**：旧版把结果开在新窗口（jgbyz.html），所以每一轮都要
+        主页面和弹出窗口一起看；找到结论的那一页记在 ``self._result_page``，
+        导出 PDF 也要用它——那才是用户要的「已查验」页面。
         """
+        self._result_page = None
+
         # 1) 接口已经给了明确结论，直接用
         if api is not None:
             code, msg = self._api_message(api)
@@ -894,31 +965,54 @@ class PlaywrightVerifier(BaseVerifier):
         body = ""
 
         while time.monotonic() < deadline:
-            # 0) 平台自绘的提示框——旧版把「验证码错误!」这类结论都放这里，
-            #    优先读它：比扫整页文本准，也不会被帮助文字干扰
-            alert = self._read_alert_message(page)
-            if alert:
-                status = classify(alert, self.cfg, "")
-                if status != "unknown":
-                    return status, alert, self._body_text(page)
-
-            # 2) 兜底：万一 expect_response 没接住，再看看监听器有没有存下响应
-            if api is None:
-                payload = self._take_query_payload()
-                if payload is not None:
-                    code, msg = self._api_message(payload)
-                    status = classify(msg, self.cfg, "")
-                    if status == "unknown" and code == _CODE_CAPTCHA_WRONG:
-                        status = "captcha_wrong"
+            for cand in self._result_pages(page):
+                # 0) 平台自绘的提示框——「验证码错误!」这类结论都放这里，
+                #    优先读它：比扫整页文本准，也不会被帮助文字干扰
+                alert = self._read_alert_message(cand)
+                if alert:
+                    status = classify(alert, self.cfg, "")
                     if status != "unknown":
-                        return status, msg, self._body_text(page)
+                        self._result_page = cand
+                        return status, alert, self._body_text(cand)
 
-            # 3) 再兜底：读页面文本
-            body = self._body_text(page)
-            if body:
-                status = classify(body, self.cfg, baseline)
-                if status != "unknown":
-                    return status, self._summarize(status, body), body
+                # 2) 兜底：万一 expect_response 没接住，再看看监听器有没有存下响应
+                if api is None:
+                    payload = self._take_query_payload()
+                    if payload is not None:
+                        code, msg = self._api_message(payload)
+                        status = classify(msg, self.cfg, "")
+                        if status == "unknown" and code == _CODE_CAPTCHA_WRONG:
+                            status = "captcha_wrong"
+                        if status != "unknown":
+                            self._result_page = cand
+                            return status, msg, self._body_text(cand)
+
+                # 3) 再兜底：读页面文本。
+                #    弹窗页有它自己的 baseline——主页面跳没跳转跟它无关，
+                #    结果页第一次读到就是新内容，所以这里不跟主页面的 baseline 比。
+                text = self._body_text(cand)
+                if text:
+                    if cand is not page:
+                        # 结果窗口：优先只用「结果：xxx」那个字段；
+                        # 拿不到才退回整页文本，且先剔掉那句带「不符」的固定说明。
+                        field = result_field(text)
+                        if field:
+                            status = classify(field, self.cfg, "")
+                            if status != "unknown":
+                                self._result_page = cand
+                                return status, f"结果：{field}", text
+                        status = classify(strip_result_boilerplate(text),
+                                          self.cfg, "")
+                        if status != "unknown":
+                            self._result_page = cand
+                            return status, self._summarize(status, text), text
+                        continue
+
+                    status = classify(text, self.cfg, baseline)
+                    if status != "unknown":
+                        self._result_page = cand
+                        return status, self._summarize(status, text), text
+                    body = text
 
             page.wait_for_timeout(400)
 
