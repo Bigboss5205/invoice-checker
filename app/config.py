@@ -99,7 +99,9 @@ DEFAULTS: dict[str, Any] = {
         "headless": True,          # False 会弹出真实浏览器窗口
         "browser_channel": "msedge",  # msedge | chrome | chromium | auto
         "nav_timeout_ms": 45000,
-        "result_timeout_ms": 30000,
+        # 等结论的上限。只在「接口没返回、只能靠页面文本判定」时才真的等这么久；
+        # 接口一返回结论就立刻结束。旧版平台几秒内就有响应，30 秒纯属白等。
+        "result_timeout_ms": 18000,
         "min_interval_seconds": 8, # 两张票之间的最小间隔，别调太小
         "max_attempts": 2,         # 同一张票整体重试次数
         "stop_on_consecutive_failures": 0,  # >0 时连续失败这么多次就停下
