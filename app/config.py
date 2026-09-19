@@ -92,6 +92,27 @@ DEFAULTS: dict[str, Any] = {
         "max_auto_attempts": 6,    # 仅在 auto_ocr=true 时有意义
         "manual_timeout_seconds": 180,
         "manual_max_rounds": 3,    # 人工最多被要求输入几次
+
+        # 视觉大模型识别验证码（可选，但强烈建议——它是唯一能免去逐张手敲的办法）。
+        #
+        # 平台的验证码是「挑出指定颜色的字符」且中英混排，ddddocr 基本认不出；
+        # 视觉模型跟人一样看图 + 按提示挑颜色，成功率天差地别。
+        # 填好下面三项就自动生效（auto_ocr 开不开都行），不填则完全不启用。
+        #
+        #   接口要求：兼容 OpenAI 的 POST {base_url}/chat/completions，
+        #            消息 content 里带 image_url（即"看图"能力）。
+        #   例：https://api.openai.com/v1 + gpt-4o-mini
+        #       https://dashscope.aliyuncs.com/compatible-mode/v1 + qwen-vl-max
+        #       https://open.bigmodel.cn/api/paas/v4 + glm-4v-flash
+        #   注意：**模型必须支持图片输入**，纯文本模型（如 deepseek-chat）不行。
+        #
+        # 发出去的只有验证码图片本身，不含任何发票信息。
+        "ai": {
+            "base_url": "",            # 三项都填齐就自动启用；留空则这一路不启用
+            "model": "",
+            "api_key": "",             # 也可以不写在这，用环境变量 INV_CAPTCHA_AI_KEY
+            "timeout_seconds": 20,
+        },
     },
     "verify": {
         "enabled": True,
