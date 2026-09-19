@@ -599,6 +599,14 @@ class PlaywrightVerifier(BaseVerifier):
             try:
                 with page.expect_response(
                         lambda r: _QUERY_API_MARK in r.url, timeout=12000) as info:
+                    # 提交前最后一道闸：日期可能在这期间被站点的日历控件改掉，
+                    # 一改整张票必然判「不一致」。
+                    if not self._enforce_date(page, inputs):
+                        return VerifyOutcome(
+                            status="error",
+                            summary="开票日期被页面改掉了，重写后仍不对，"
+                                    "为免误判「不一致」已中止本次提交",
+                            captcha_attempts=attempts)
                     if not self._click_submit(page):
                         log.warning(
                             "没能点中「查验」按钮（可见且可点的那个没找到）"
@@ -910,14 +918,41 @@ class PlaywrightVerifier(BaseVerifier):
             return False
 
         page.wait_for_timeout(600)
-        got = (self._input_value(loc) or "").replace("-", "").replace("/", "")
-        if got != ymd:
-            log.warning("日期回读不一致：期望 %s，实际 %r", ymd, got)
-            return False
+
+        # 把日历控件**自己的内部状态**也同步过去。
+        # 页面用的是 bootstrap-datepicker；它内部默认停在「今天」，
+        # 一旦面板关闭或输入框失焦，就会把自己的日期写回输入框——
+        # 实测事故：票面开票日期 14 日，被写成了 19 日（今天），
+        # 平台据此判「不一致」。只写 input 的值是不够的，必须同时喂给控件。
+        try:
+            loc.evaluate(
+                """(el, v) => {
+                    const iso = v.slice(0,4) + '-' + v.slice(4,6) + '-' + v.slice(6,8);
+                    const jq = window.jQuery || window.$;
+                    if (jq && jq.fn && jq.fn.datepicker) {
+                        try { jq(el).datepicker('update', iso); } catch (e) {}
+                        try { jq(el).datepicker('setDate', iso); } catch (e) {}
+                    }
+                }""",
+                ymd,
+            )
+        except Exception as exc:
+            log.debug("同步日历控件状态失败：%s", exc)
 
         # 关掉日期弹出的日历面板。它会浮在页面上**挡住「查验」按钮**，
         # 这时点提交其实点在日历上，请求根本发不出去——实测踩过这个坑。
         self._dismiss_popups(page)
+        page.wait_for_timeout(200)
+
+        # 回读放在**关掉面板之后**：真正的漂移就发生在关闭/失焦那一下
+        got = (self._input_value(loc) or "").replace("-", "").replace("/", "")
+        if got != ymd:
+            # 面板关闭/失焦时，控件会把它内部的日期（默认今天）写回来。
+            # 不要就此认输——按原生 setter 再写一次并复核。
+            log.warning("日期被日历控件改成了 %r（应为 %s），重新写入", got, ymd)
+            iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
+            if not self._enforce_date(page, {"invoice_date": iso}):
+                return False
         return True
 
     @staticmethod
@@ -1048,6 +1083,60 @@ class PlaywrightVerifier(BaseVerifier):
         except Exception as exc:
             log.warning("点击查验按钮失败：%s", exc)
             return False
+
+    def _enforce_date(self, page, inputs: dict[str, Any]) -> bool:
+        """提交前把开票日期再核一遍，不对就重写。
+
+        为什么必须在**提交前**再查一次：填表阶段读回是对的，日期是在那之后
+        才被改掉的——站点的日历控件（bootstrap-datepicker）在面板关闭或
+        输入框失焦时，会把它内部的日期写回输入框，而它内部默认停在**今天**。
+
+        实测事故：票面开票日期 14 日，提交时变成 19 日（今天），
+        平台据此判「不一致」。开票日期错了整张票必然对不上，
+        所以这一步是最后一道闸。
+        """
+        m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})",
+                         str(inputs.get("invoice_date") or ""))
+        if not m:
+            return True
+        ymd = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+
+        loc = self._locator(page, "invoice_date", wait_ms=2000)
+        if loc is None:
+            return True
+
+        def _read() -> str:
+            return (self._input_value(loc) or "").replace("-", "").replace("/", "")
+
+        if _read() == ymd:
+            return True
+
+        log.warning("提交前发现开票日期被改成了 %r（应为 %s），重新写入",
+                    _read(), ymd)
+        try:
+            loc.evaluate(
+                """(el, v) => {
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(el, v);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                }""",
+                ymd,
+            )
+        except Exception as exc:
+            log.warning("重写开票日期失败：%s", exc)
+            return False
+
+        page.wait_for_timeout(300)
+        got = _read()
+        if got != ymd:
+            log.warning("开票日期仍然不对：期望 %s，实际 %r（这张票先不提交）",
+                        ymd, got)
+            return False
+        log.info("已把开票日期改回 %s", ymd)
+        return True
 
     def _wait_result(self, page, baseline: str, api: dict | None = None
                      ) -> tuple[str, str, str]:
